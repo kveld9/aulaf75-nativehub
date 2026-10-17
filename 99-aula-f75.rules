@@ -1,11 +1,17 @@
 # udev rules for AULA F75 keyboard (BY Tech Gaming)
-# Grants unprivileged user access to the hidraw device node via the uaccess tag.
+# Grants unprivileged user access to the hidraw device node via the uaccess tag and mode 0666.
 #
 # Default hardware IDs:
 #   Vendor ID:  258a (BY Tech Gaming)
 #   Product ID: 010c (AULA F75 USB Mode)
 #
+# MODE="0666" ensures unprivileged read/write access to the hidraw control node
+# on target environments where the systemd uaccess tag alone does not grant
+# necessary device permissions (e.g. non-seat, headless, or containerized sessions).
+# TAG+="uaccess" is retained for compatibility with standard desktop seat managers.
+#
 # To adapt for another VID/PID variant (e.g. 2.4GHz wireless dongle or alternate revisions):
 # edit the ATTRS{idVendor} and ATTRS{idProduct} values below or duplicate the line.
 
-KERNEL=="hidraw*", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="010c", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="010c", MODE="0666", TAG+="uaccess"
+
