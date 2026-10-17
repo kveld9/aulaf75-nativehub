@@ -11,6 +11,11 @@ path = "src/lib.rs"
 name = "aula-f75-rs"
 path = "src/main.rs"
 
+[[bin]]
+name = "aula-f75-gui"
+path = "src/bin/aula-f75-gui.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+eframe = "0.31"
 libc = "0.2"

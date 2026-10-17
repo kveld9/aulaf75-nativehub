@@ -9,6 +9,7 @@ The AULA F75 keyboard exposes USB HID interfaces (typical VID `258a`, PID `010c`
 - **Tranche 1**: Repository scaffolding, injectable device abstractions, and read-only device inspection.
 - **Tranche 2**: Verified direct RGB lighting write paths (`solid`, `off`) using Linux stdlib `hidraw` ioctls on interface 1.
 - **Tranche 3**: Standalone Rust CLI binary (`aula-f75-rs`) with zero external native dependencies beyond `libc`.
+- **Tranche 4**: Native Rust GUI (`aula-f75-gui`) using `egui` and `eframe` with a non-blocking streaming worker thread.
 
 ## Non-Goals & Safety Rules
 
@@ -122,9 +123,42 @@ cargo build --release
 ./target/release/aula-f75-rs info
 ```
 
+## Rust GUI (`aula-f75-gui`)
+
+Tranche 4 provides a native Linux desktop GUI application built with `eframe` and `egui`, reusing the verified direct RGB protocol and device resolution logic from the core crate.
+
+### Requirements
+
+- Active desktop session (X11 or Wayland).
+- Udev rule configured (`99-aula-f75.rules`) to allow unprivileged user access to `/dev/hidraw*`.
+
+### Running
+
+```bash
+cd rust
+cargo run --bin aula-f75-gui
+```
+
+Alternatively, run the compiled release binary:
+
+```bash
+./target/release/aula-f75-gui
+```
+
+### Features
+
+- **Reactive Status Header**: Displays connection indicator, resolved `/dev/hidraw*` interface 1 control node path, and surfaces any permission or disconnection errors without panicking.
+- **Color Controls**: Interactive color picker widget, manual RGB channel sliders, and hex text field supporting 6-digit hex values (e.g. `FF0000` or `#00FFFF`).
+- **Non-Blocking Streaming Worker**: Direct RGB keepalive frames are transmitted at ~1.5 Hz (`KEEPALIVE_HZ`) on a dedicated background thread, matching the CLI retry and backoff behavior on transient communication errors. The UI rendering thread is never blocked on USB I/O.
+- **Solid & Off Actions**: "Solid" starts or updates the continuous direct RGB keepalive stream. "Off" sends an all-zero frame to turn off lighting, cleanly terminates the worker thread, and closes the device descriptor.
+- **Clean Lifecycle**: Closing the application window signals worker termination, joins the thread, and closes the file descriptor with zero resource leaks.
+
+> [!NOTE]
+> **CUSTOM Mode Requirement**: The physical keyboard must be toggled into its onboard "Custom" / user static RGB mode (via onboard Fn shortcuts) for software-driven colors to display.
+
 ### Verification Gate
 
-All unit and integration tests are strictly hardware-free and testable without physical devices:
+All unit and integration tests are strictly hardware-free and testable without physical devices or active desktop display sessions:
 
 ```bash
 cd rust
