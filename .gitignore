@@ -1,0 +1,19 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.pyc
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+
+# Windows binaries and archives (upstream vendor tools)
+*.exe
+*.zip
+
+# Reference captures and raw dumps
+reference/
+captures/
