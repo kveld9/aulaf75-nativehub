@@ -6,11 +6,12 @@
 //! thread is never blocked.
 
 use std::fs::OpenOptions;
+use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -58,6 +59,8 @@ pub enum WorkerMessage {
 /// Status and lifecycle events emitted by the background worker.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkerStatus {
+    /// Worker is waiting or retrying to connect/reconnect to device node.
+    Connecting,
     /// Worker successfully opened device node and entered keepalive loop.
     Running(PathBuf),
     /// Worker stopped execution cleanly.
@@ -153,7 +156,7 @@ pub fn run_worker_stream<F, S>(
     initial_cmd: WorkerMessage,
     interval: Duration,
     mut send_fn: F,
-    mut _sleep_fn: S,
+    mut sleep_fn: S,
 ) where
     F: FnMut(&[u8; proto::FRAME_LEN]) -> Result<(), std::io::Error>,
     S: FnMut(Duration),
@@ -346,7 +349,8 @@ pub fn run_worker_stream<F, S>(
             }
             Err(e) => {
                 let code = e.raw_os_error();
-                if code == Some(libc::EPIPE) || code == Some(libc::ETIMEDOUT) {
+                let is_transient = code == Some(libc::EPIPE) || code == Some(libc::ETIMEDOUT);
+                if is_transient {
                     consecutive_failures += 1;
                     if consecutive_failures >= 10 {
                         let _ = status_tx.send(WorkerStatus::Error(format!(
@@ -355,6 +359,8 @@ pub fn run_worker_stream<F, S>(
                         )));
                         break;
                     }
+                    let backoff = Duration::from_millis(10 * consecutive_failures as u64);
+                    sleep_fn(backoff);
                 } else {
                     let _ = status_tx.send(WorkerStatus::Error(format!(
                         "Device communication error: {}",
@@ -430,51 +436,418 @@ pub fn run_worker_stream<F, S>(
     let _ = status_tx.send(WorkerStatus::Stopped);
 }
 
+/// Helper to build direct, off, or dynamic effect frame.
+fn render_effect_frame(
+    effect: &Effect,
+    brightness: f32,
+    t: f64,
+    key_slots: &[u8],
+) -> Result<[u8; proto::FRAME_LEN], String> {
+    match effect {
+        Effect::Solid(rgb) => {
+            let scaled_rgb = rgb.scale(brightness).to_tuple();
+            proto::build_direct_frame(scaled_rgb)
+                .map_err(|e| format!("Frame build error: {}", e))
+        }
+        Effect::Off => proto::build_direct_frame((0, 0, 0))
+            .map_err(|e| format!("Frame build error: {}", e)),
+        dynamic_effect => {
+            let pairs = effects::render(dynamic_effect, t, key_slots);
+            let scaled = effects::apply_brightness(&pairs, brightness);
+            proto::build_slot_frame(&scaled)
+                .map_err(|e| format!("Frame build error: {}", e))
+        }
+    }
+}
+
+/// Helper to build per-key frame.
+fn render_keys_frame(
+    keys: &[(String, (u8, u8, u8))],
+) -> Result<[u8; proto::FRAME_LEN], String> {
+    let borrowed: Vec<(&str, (u8, u8, u8))> =
+        keys.iter().map(|(k, c)| (k.as_str(), *c)).collect();
+    proto::build_key_frame(&borrowed)
+        .map_err(|e| format!("Frame build error: {}", e))
+}
+
+/// Core reconnecting worker loop that automatically discovers and reopens the device.
+///
+/// When no device is open (initial startup, unplug, or communication error),
+/// retries `resolve_fn` at `reconnect_interval` (~2s in production) and resumes streaming
+/// automatically with the current parameters when the device reappears.
+pub fn run_worker_reconnect_loop<R, O, D, F, S>(
+    rx: Receiver<WorkerMessage>,
+    status_tx: Sender<WorkerStatus>,
+    initial_cmd: WorkerMessage,
+    reconnect_interval: Duration,
+    keepalive_interval: Duration,
+    mut resolve_fn: R,
+    mut open_fn: O,
+    mut send_fn: F,
+    mut sleep_fn: S,
+) where
+    R: FnMut() -> Option<PathBuf>,
+    O: FnMut(&PathBuf) -> Result<D, io::Error>,
+    F: FnMut(&mut D, &[u8; proto::FRAME_LEN]) -> Result<(), io::Error>,
+    S: FnMut(Duration),
+{
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let (mut current_effect, mut current_brightness, mut current_keys, mut current_music) =
+        match initial_cmd {
+            WorkerMessage::SetColor(rgb) => {
+                (Effect::Solid(RGB(rgb.0, rgb.1, rgb.2)), 1.0f32, None, None)
+            }
+            WorkerMessage::SetEffect { effect, brightness } => (effect, brightness, None, None),
+            WorkerMessage::SetKeyFrame(keys) => (Effect::Off, 1.0f32, Some(keys), None),
+            WorkerMessage::SetMusic { mode, color, gain } => {
+                (Effect::Off, 1.0f32, None, Some((mode, color, gain)))
+            }
+            WorkerMessage::Off => {
+                if let Some(node) = resolve_fn() {
+                    if let Ok(mut dev) = open_fn(&node) {
+                        if let Ok(off_frame) = proto::build_direct_frame((0, 0, 0)) {
+                            let _ = send_fn(&mut dev, &off_frame);
+                        }
+                    }
+                }
+                let _ = status_tx.send(WorkerStatus::Stopped);
+                return;
+            }
+            WorkerMessage::Stop => {
+                let _ = status_tx.send(WorkerStatus::Stopped);
+                return;
+            }
+        };
+
+    let mut active_device: Option<(PathBuf, D)> = None;
+    let mut reported_connecting = false;
+    let mut consecutive_failures = 0;
+    let key_slots = proto::all_key_slots();
+    let stream_start = Instant::now();
+
+    let mut music_child: Option<ChildGuard> = None;
+    let mut music_sample_buf = std::collections::VecDeque::with_capacity(2048);
+    let mut music_mags = vec![0.0f32; 512];
+    let mut music_autogain = music::AutoGain::new();
+    let music_plan = music::FftPlan::new(1024);
+
+    'outer: loop {
+        // 1. Device resolution & opening when not connected
+        if active_device.is_none() {
+            if !reported_connecting {
+                let _ = status_tx.send(WorkerStatus::Connecting);
+                reported_connecting = true;
+            }
+
+            if let Some(node) = resolve_fn() {
+                match open_fn(&node) {
+                    Ok(dev) => {
+                        let _ = status_tx.send(WorkerStatus::Running(node.clone()));
+                        active_device = Some((node, dev));
+                        reported_connecting = false;
+                        consecutive_failures = 0;
+                    }
+                    Err(e) => {
+                        let _ = status_tx.send(WorkerStatus::Error(format!(
+                            "Failed to open {}: {}",
+                            node.display(),
+                            e
+                        )));
+                    }
+                }
+            }
+
+            if active_device.is_none() {
+                let wait_start = Instant::now();
+                while wait_start.elapsed() < reconnect_interval {
+                    let remaining = reconnect_interval.saturating_sub(wait_start.elapsed());
+                    let poll_step = remaining.min(Duration::from_millis(50));
+                    match rx.recv_timeout(poll_step) {
+                        Ok(WorkerMessage::Stop) => {
+                            break 'outer;
+                        }
+                        Ok(WorkerMessage::Off) => {
+                            break 'outer;
+                        }
+                        Ok(WorkerMessage::SetColor(rgb)) => {
+                            current_music = None;
+                            current_keys = None;
+                            current_effect = Effect::Solid(RGB(rgb.0, rgb.1, rgb.2));
+                            current_brightness = 1.0;
+                        }
+                        Ok(WorkerMessage::SetEffect { effect, brightness }) => {
+                            current_music = None;
+                            current_keys = None;
+                            current_effect = effect;
+                            current_brightness = brightness;
+                        }
+                        Ok(WorkerMessage::SetKeyFrame(keys)) => {
+                            current_music = None;
+                            current_keys = Some(keys);
+                        }
+                        Ok(WorkerMessage::SetMusic { mode, color, gain }) => {
+                            current_keys = None;
+                            current_music = Some((mode, color, gain));
+                        }
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => {
+                            break 'outer;
+                        }
+                    }
+                }
+                continue 'outer;
+            }
+        }
+
+        let t = stream_start.elapsed().as_secs_f64();
+
+        // 2. Audio monitor child process for music mode
+        if let Some((_, _, gain)) = current_music {
+            if music_child.is_none() {
+                match music::spawn_monitor() {
+                    Ok(child) => {
+                        if let Some(ref stdout) = child.stdout {
+                            let fd = stdout.as_raw_fd();
+                            unsafe {
+                                let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+                                if flags >= 0 {
+                                    libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                                }
+                            }
+                        }
+                        music_child = Some(ChildGuard(child));
+                    }
+                    Err(e) => {
+                        let _ = status_tx.send(WorkerStatus::Error(e));
+                        current_music = None;
+                    }
+                }
+            }
+
+            // Non-blocking read of available audio samples
+            let mut read_failed = false;
+            if let Some(ref mut guard) = music_child {
+                if let Some(ref mut stdout) = guard.0.stdout {
+                    let mut chunk_buf = [0u8; 8820];
+                    loop {
+                        match std::io::Read::read(stdout, &mut chunk_buf) {
+                            Ok(0) => {
+                                read_failed = true;
+                                break;
+                            }
+                            Ok(n) => {
+                                let num_samples = n / 4;
+                                for i in 0..num_samples {
+                                    let offset = i * 4;
+                                    let left = i16::from_le_bytes([chunk_buf[offset], chunk_buf[offset + 1]]);
+                                    let right = i16::from_le_bytes([chunk_buf[offset + 2], chunk_buf[offset + 3]]);
+                                    let mono = ((left as f32 + right as f32) / (2.0 * 32768.0)) * gain;
+                                    music_sample_buf.push_back(mono);
+                                }
+                                while music_sample_buf.len() > 1024 {
+                                    music_sample_buf.pop_front();
+                                }
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                break;
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                                continue;
+                            }
+                            Err(_) => {
+                                read_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if read_failed {
+                music_child = None;
+                current_music = None;
+            }
+        }
+
+        // 3. Build RGB frame
+        let frame = if let Some((mode, color, _)) = current_music {
+            if music_sample_buf.len() >= 1024 {
+                let block: Vec<f32> = music_sample_buf.iter().copied().collect();
+                music_plan.compute(&block, &mut music_mags);
+                let band_energies =
+                    music::bands_with_autogain(&music_mags, 16, 44100.0, &mut music_autogain);
+                let _ = status_tx.send(WorkerStatus::MusicBands(band_energies.clone()));
+                let pairs = music::bands_to_colors(&band_energies, color, mode);
+                match proto::build_slot_frame(&pairs) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = status_tx
+                            .send(WorkerStatus::Error(format!("Frame build error: {}", e)));
+                        active_device = None;
+                        continue 'outer;
+                    }
+                }
+            } else {
+                match proto::build_direct_frame((0, 0, 0)) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = status_tx
+                            .send(WorkerStatus::Error(format!("Frame build error: {}", e)));
+                        active_device = None;
+                        continue 'outer;
+                    }
+                }
+            }
+        } else if let Some(ref keys) = current_keys {
+            match render_keys_frame(keys) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = status_tx.send(WorkerStatus::Error(e));
+                    active_device = None;
+                    continue 'outer;
+                }
+            }
+        } else {
+            match render_effect_frame(&current_effect, current_brightness, t, &key_slots) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = status_tx.send(WorkerStatus::Error(e));
+                    active_device = None;
+                    continue 'outer;
+                }
+            }
+        };
+
+        // 4. Transmit frame to open device
+        if let Some((_, ref mut dev)) = active_device {
+            match send_fn(dev, &frame) {
+                Ok(()) => {
+                    consecutive_failures = 0;
+                }
+                Err(e) => {
+                    let code = e.raw_os_error();
+                    let is_transient = code == Some(libc::EPIPE) || code == Some(libc::ETIMEDOUT);
+                    if is_transient {
+                        consecutive_failures += 1;
+                        if consecutive_failures >= 10 {
+                            let _ = status_tx.send(WorkerStatus::Error(format!(
+                                "Device communication failed after 10 retries: {}",
+                                e
+                            )));
+                            // Close device handle and transition to reconnecting
+                            active_device = None;
+                            consecutive_failures = 0;
+                        } else {
+                            let backoff = Duration::from_millis(10 * consecutive_failures as u64);
+                            sleep_fn(backoff);
+                        }
+                    } else {
+                        let _ = status_tx.send(WorkerStatus::Error(format!(
+                            "Device communication error: {}",
+                            e
+                        )));
+                        // Fatal error (e.g. ENODEV on unplug): close and reconnect
+                        active_device = None;
+                        consecutive_failures = 0;
+                    }
+                }
+            }
+        }
+
+        // 5. Calculate tick interval and process channel messages
+        let tick_interval = if current_music.is_some() {
+            Duration::from_millis(50)
+        } else if current_keys.is_some() {
+            keepalive_interval
+        } else {
+            match current_effect {
+                Effect::Solid(_) => keepalive_interval,
+                _ => Duration::from_millis(40),
+            }
+        };
+
+        let start = Instant::now();
+        while start.elapsed() < tick_interval {
+            let remaining = tick_interval.saturating_sub(start.elapsed());
+            let poll_step = remaining.min(Duration::from_millis(10));
+            match rx.recv_timeout(poll_step) {
+                Ok(WorkerMessage::SetColor(new_color)) => {
+                    current_music = None;
+                    music_child = None;
+                    current_keys = None;
+                    current_effect = Effect::Solid(RGB(new_color.0, new_color.1, new_color.2));
+                    break;
+                }
+                Ok(WorkerMessage::SetEffect { effect, brightness }) => {
+                    current_music = None;
+                    music_child = None;
+                    current_keys = None;
+                    current_effect = effect;
+                    current_brightness = brightness;
+                    break;
+                }
+                Ok(WorkerMessage::SetKeyFrame(keys)) => {
+                    current_music = None;
+                    music_child = None;
+                    current_keys = Some(keys);
+                    break;
+                }
+                Ok(WorkerMessage::SetMusic { mode, color, gain }) => {
+                    current_keys = None;
+                    current_music = Some((mode, color, gain));
+                    break;
+                }
+                Ok(WorkerMessage::Off) => {
+                    music_child = None;
+                    if let Some((_, ref mut dev)) = active_device {
+                        if let Ok(off_frame) = proto::build_direct_frame((0, 0, 0)) {
+                            let _ = send_fn(dev, &off_frame);
+                        }
+                    }
+                    break 'outer;
+                }
+                Ok(WorkerMessage::Stop) => {
+                    music_child = None;
+                    break 'outer;
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    drop(music_child);
+    drop(active_device);
+    let _ = status_tx.send(WorkerStatus::Stopped);
+}
+
 /// Production worker thread runner that manages device handle lifetime.
 fn run_worker_thread(
     rx: Receiver<WorkerMessage>,
     status_tx: Sender<WorkerStatus>,
     initial_cmd: WorkerMessage,
 ) {
-    let node = match device::resolve_control_node() {
-        Some(p) => p,
-        None => {
-            let _ = status_tx.send(WorkerStatus::Error(
-                "AULA F75 interface 1 control node not found".to_string(),
-            ));
-            let _ = status_tx.send(WorkerStatus::Stopped);
-            return;
-        }
-    };
-
-    let file = match OpenOptions::new().read(true).write(true).open(&node) {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = status_tx.send(WorkerStatus::Error(format!(
-                "Failed to open {}: {}",
-                node.display(),
-                e
-            )));
-            let _ = status_tx.send(WorkerStatus::Stopped);
-            return;
-        }
-    };
-
-    let _ = status_tx.send(WorkerStatus::Running(node));
-
-    let fd = file.as_raw_fd();
-    let interval = Duration::from_secs_f64(1.0 / proto::KEEPALIVE_HZ);
-
-    run_worker_stream(
+    let keepalive_interval = Duration::from_secs_f64(1.0 / proto::KEEPALIVE_HZ);
+    run_worker_reconnect_loop(
         rx,
         status_tx,
         initial_cmd,
-        interval,
-        |frame| proto::hid_set_feature(fd, frame),
+        Duration::from_secs(2),
+        keepalive_interval,
+        device::resolve_control_node,
+        |path| OpenOptions::new().read(true).write(true).open(path),
+        |file, frame| proto::hid_set_feature(file.as_raw_fd(), frame),
         thread::sleep,
     );
-
-    drop(file);
 }
 
 /// Main AULA F75 eframe GUI Application.
@@ -516,22 +889,17 @@ pub struct AulaF75App {
     pub last_music_bands: Vec<f32>,
 
     /// Channel sender to worker thread.
-    worker_tx: Option<Sender<WorkerMessage>>,
+    pub worker_tx: Option<Sender<WorkerMessage>>,
     /// Channel receiver for status events from worker thread.
-    status_rx: Option<Receiver<WorkerStatus>>,
+    pub status_rx: Option<Receiver<WorkerStatus>>,
     /// Background worker thread handle.
-    worker_handle: Option<JoinHandle<()>>,
+    pub worker_handle: Option<JoinHandle<()>>,
 }
 
 impl Default for AulaF75App {
     fn default() -> Self {
         let initial_rgb = [255, 0, 0];
         let initial_hex = "FF0000".to_string();
-        let detected = device::resolve_control_node();
-        let status_text = match &detected {
-            Some(path) => format!("Device detected: {}", path.display()),
-            None => "Device not connected".to_string(),
-        };
 
         let saved = profile::list_profiles(None).unwrap_or_default();
         let initial_selected = saved.first().cloned();
@@ -546,8 +914,8 @@ impl Default for AulaF75App {
             hex_error: None,
             brightness: 1.0,
             selected_effect: "Solid".to_string(),
-            control_node_path: detected,
-            status_text,
+            control_node_path: None,
+            status_text: "Device not connected".to_string(),
             last_error: None,
             saved_profiles: saved,
             selected_profile: initial_selected,
@@ -571,7 +939,10 @@ impl AulaF75App {
 
     /// Check if the streaming worker thread is active.
     pub fn is_worker_running(&self) -> bool {
-        self.worker_handle.is_some()
+        match self.worker_handle {
+            Some(ref handle) => !handle.is_finished(),
+            None => false,
+        }
     }
 
     /// Check if music reactive mode is actively streaming.
@@ -581,44 +952,68 @@ impl AulaF75App {
 
     /// Poll worker status channel non-blockingly and update UI state.
     pub fn poll_worker_status(&mut self) {
-        if let Some(ref rx) = self.status_rx {
-            while let Ok(status) = rx.try_recv() {
-                match status {
-                    WorkerStatus::Running(path) => {
-                        self.control_node_path = Some(path.clone());
-                        self.status_text = format!("Streaming active on {}", path.display());
-                        self.last_error = None;
-                    }
-                    WorkerStatus::Stopped => {
-                        self.worker_tx = None;
-                        if let Some(handle) = self.worker_handle.take() {
-                            let _ = handle.join();
-                        }
-                        self.state.mode = GuiLightingMode::Off;
-                        self.last_music_bands.clear();
-                        if self.last_error.is_none() {
-                            self.status_text = "Idle (Lighting off)".to_string();
-                        }
-                    }
-                    WorkerStatus::Error(err) => {
-                        self.last_error = Some(err.clone());
-                        self.status_text = format!("Error: {}", err);
-                    }
-                    WorkerStatus::MusicBands(bands) => {
-                        self.last_music_bands = bands;
-                    }
-                }
+        let pending: Vec<WorkerStatus> = {
+            let rx = match self.status_rx.as_ref() {
+                Some(r) => r,
+                None => return,
+            };
+            let mut v = Vec::new();
+            while let Ok(s) = rx.try_recv() {
+                v.push(s);
             }
+            v
+        };
+
+        for status in pending {
+            self.handle_worker_status(status);
         }
+    }
+
+    fn handle_worker_status(&mut self, status: WorkerStatus) {
+        match status {
+            WorkerStatus::Connecting => self.on_status_connecting(),
+            WorkerStatus::Running(path) => self.on_status_running(path),
+            WorkerStatus::Stopped => self.on_status_stopped(),
+            WorkerStatus::Error(err) => self.on_status_error(err),
+            WorkerStatus::MusicBands(bands) => self.last_music_bands = bands,
+        }
+    }
+
+    fn on_status_connecting(&mut self) {
+        self.control_node_path = None;
+        self.status_text = "Connecting...".to_string();
+    }
+
+    fn on_status_running(&mut self, path: PathBuf) {
+        self.control_node_path = Some(path.clone());
+        self.status_text = format!("Streaming active on {}", path.display());
+        self.last_error = None;
+    }
+
+    fn on_status_stopped(&mut self) {
+        self.worker_tx = None;
+        self.worker_handle = None;
+        self.status_rx = None;
+        self.control_node_path = None;
+        self.state.mode = GuiLightingMode::Off;
+        self.last_music_bands.clear();
+        self.status_text = "Disconnected".to_string();
+    }
+
+    fn on_status_error(&mut self, err: String) {
+        self.last_error = Some(err.clone());
+        self.status_text = format!("Error: {}", err);
     }
 
     /// Dispatch music reactive lighting to running worker or start a new worker.
     pub fn start_music(&mut self) {
         let rgb = (self.color_rgb[0], self.color_rgb[1], self.color_rgb[2]);
         let msg = self.state.transition_to_music(self.music_mode, rgb, self.music_gain);
-        if let Some(ref tx) = self.worker_tx {
-            let _ = tx.send(msg);
-            self.status_text = format!("Streaming music ({})", self.music_mode);
+        if self.is_worker_running() {
+            if let Some(ref tx) = self.worker_tx {
+                let _ = tx.send(msg);
+                self.status_text = format!("Streaming music ({})", self.music_mode);
+            }
         } else {
             self.start_worker(msg);
         }
@@ -649,9 +1044,11 @@ impl AulaF75App {
         }
 
         let msg = self.state.transition_to_effect(effect.clone(), self.brightness);
-        if let Some(ref tx) = self.worker_tx {
-            let _ = tx.send(msg);
-            self.status_text = format!("Streaming {}", self.selected_effect);
+        if self.is_worker_running() {
+            if let Some(ref tx) = self.worker_tx {
+                let _ = tx.send(msg);
+                self.status_text = format!("Streaming {}", self.selected_effect);
+            }
         } else {
             self.start_worker(msg);
         }
@@ -694,10 +1091,12 @@ impl AulaF75App {
         self.color_rgb = [rgb.0, rgb.1, rgb.2];
         self.selected_effect = "Solid".to_string();
 
-        if let Some(ref tx) = self.worker_tx {
-            let msg = self.state.transition_to_solid(rgb);
-            let _ = tx.send(msg);
-            self.status_text = format!("Streaming solid #{:02X}{:02X}{:02X}", rgb.0, rgb.1, rgb.2);
+        if self.is_worker_running() {
+            if let Some(ref tx) = self.worker_tx {
+                let msg = self.state.transition_to_solid(rgb);
+                let _ = tx.send(msg);
+                self.status_text = format!("Streaming solid #{:02X}{:02X}{:02X}", rgb.0, rgb.1, rgb.2);
+            }
         } else {
             self.start_worker(WorkerMessage::SetColor(rgb));
         }
@@ -716,6 +1115,12 @@ impl AulaF75App {
 
     /// Spawn worker thread with initial command.
     pub fn start_worker(&mut self, initial_cmd: WorkerMessage) {
+        if self.is_worker_running() {
+            if let Some(ref tx) = self.worker_tx {
+                let _ = tx.send(initial_cmd);
+                return;
+            }
+        }
         self.stop_worker();
 
         let (tx_cmd, rx_cmd) = mpsc::channel();
@@ -731,17 +1136,17 @@ impl AulaF75App {
         self.last_error = None;
     }
 
-    /// Terminate worker thread cleanly and join handle.
+    /// Terminate worker thread cleanly without blocking the UI thread.
     pub fn stop_worker(&mut self) {
         let msg = self.state.transition_to_stop();
         if let Some(tx) = self.worker_tx.take() {
             let _ = tx.send(msg);
         }
-        if let Some(handle) = self.worker_handle.take() {
-            let _ = handle.join();
-        }
+        self.worker_handle = None;
         self.status_rx = None;
         self.state.mode = GuiLightingMode::Off;
+        self.control_node_path = None;
+        self.status_text = "Disconnected".to_string();
     }
 
     /// Refresh the list of saved profiles from the config directory.
@@ -767,8 +1172,10 @@ impl AulaF75App {
     pub fn apply_profile(&mut self, prof: &Profile) {
         if !prof.keys.is_empty() {
             let msg = WorkerMessage::SetKeyFrame(prof.keys.clone());
-            if let Some(ref tx) = self.worker_tx {
-                let _ = tx.send(msg);
+            if self.is_worker_running() {
+                if let Some(ref tx) = self.worker_tx {
+                    let _ = tx.send(msg);
+                }
             } else {
                 self.start_worker(msg);
             }
@@ -904,7 +1311,11 @@ impl eframe::App for AulaF75App {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
                         let (indicator_color, indicator_text) = if self.is_worker_running() {
-                            (egui::Color32::from_rgb(46, 204, 113), "Streaming Active")
+                            if self.control_node_path.is_some() {
+                                (egui::Color32::from_rgb(46, 204, 113), "Streaming Active")
+                            } else {
+                                (egui::Color32::from_rgb(241, 196, 15), "Connecting...")
+                            }
                         } else if self.control_node_path.is_some() {
                             (egui::Color32::from_rgb(241, 196, 15), "Device Connected")
                         } else {

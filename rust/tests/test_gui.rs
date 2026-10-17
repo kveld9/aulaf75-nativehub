@@ -3,11 +3,12 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aula_f75::effects::Effect;
 use aula_f75::gui::{
-    parse_color_hex, run_worker_stream, GuiLightingMode, GuiState, WorkerMessage, WorkerStatus,
+    parse_color_hex, run_worker_reconnect_loop, run_worker_stream, AulaF75App, GuiLightingMode,
+    GuiState, WorkerMessage, WorkerStatus,
 };
 use aula_f75::proto::HEADER;
 
@@ -117,6 +118,9 @@ fn test_worker_status_channel_shapes() {
         WorkerStatus::Error(msg) => assert_eq!(msg, "Permission denied"),
         _ => panic!("Expected WorkerStatus::Error"),
     }
+
+    tx.send(WorkerStatus::Connecting).unwrap();
+    assert_eq!(rx.recv().unwrap(), WorkerStatus::Connecting);
 
     tx.send(WorkerStatus::Stopped).unwrap();
     assert_eq!(rx.recv().unwrap(), WorkerStatus::Stopped);
@@ -268,3 +272,235 @@ fn test_worker_stream_effect_streaming() {
     let status = status_rx.recv().unwrap();
     assert_eq!(status, WorkerStatus::Stopped);
 }
+
+#[test]
+fn test_gui_app_startup_never_blocks_or_queries_hardware() {
+    let start = Instant::now();
+    let app = AulaF75App::default();
+    let elapsed = start.elapsed();
+
+    // Startup must complete in < 50ms without performing USB or sysfs discovery
+    assert!(elapsed < Duration::from_millis(50));
+    assert_eq!(app.control_node_path, None);
+    assert_eq!(app.status_text, "Device not connected");
+    assert!(!app.is_worker_running());
+    assert!(app.last_error.is_none());
+}
+
+#[test]
+fn test_poll_worker_status_drives_cycles_nonblocking() {
+    let mut app = AulaF75App::default();
+    let (tx, rx) = mpsc::channel();
+    app.status_rx = Some(rx);
+
+    // Send a running event
+    tx.send(WorkerStatus::Running(PathBuf::from("/dev/hidraw1"))).unwrap();
+
+    let start = Instant::now();
+    for i in 0..60 {
+        app.poll_worker_status();
+        if i == 30 {
+            tx.send(WorkerStatus::MusicBands(vec![0.5; 16])).unwrap();
+        }
+    }
+    let elapsed = start.elapsed();
+
+    // 60 poll cycles must execute virtually instantaneously (well under 1s)
+    assert!(elapsed < Duration::from_millis(100));
+    assert_eq!(app.control_node_path, Some(PathBuf::from("/dev/hidraw1")));
+    assert!(app.status_text.contains("Streaming active on /dev/hidraw1"));
+    assert_eq!(app.last_music_bands.len(), 16);
+}
+
+#[test]
+fn test_stop_worker_never_joins_or_blocks_ui_thread() {
+    let mut app = AulaF75App::default();
+    let (tx_cmd, rx_cmd) = mpsc::channel();
+    app.worker_tx = Some(tx_cmd);
+
+    // Simulate a background worker that would sleep or hang if joined
+    let worker_handle = std::thread::spawn(move || {
+        let _ = rx_cmd.recv_timeout(Duration::from_secs(5));
+    });
+    app.worker_handle = Some(worker_handle);
+
+    let start = Instant::now();
+    app.stop_worker();
+    let elapsed = start.elapsed();
+
+    // stop_worker must return immediately without blocking/joining on the worker thread
+    assert!(elapsed < Duration::from_millis(50));
+    assert!(!app.is_worker_running());
+    assert_eq!(app.state.mode, GuiLightingMode::Off);
+}
+
+#[test]
+fn test_worker_status_stopped_never_joins_stuck_worker() {
+    let mut app = AulaF75App::default();
+    let (status_tx, status_rx) = mpsc::channel();
+    app.status_rx = Some(status_rx);
+
+    let (tx_cmd, rx_cmd) = mpsc::channel();
+    app.worker_tx = Some(tx_cmd);
+
+    // Worker that sleeps if joined
+    let worker_handle = std::thread::spawn(move || {
+        let _ = rx_cmd.recv_timeout(Duration::from_secs(5));
+    });
+    app.worker_handle = Some(worker_handle);
+
+    // Signal Stopped via status channel
+    status_tx.send(WorkerStatus::Stopped).unwrap();
+
+    let start = Instant::now();
+    app.poll_worker_status();
+    let elapsed = start.elapsed();
+
+    // Must process Stopped and clear worker without blocking or joining
+    assert!(elapsed < Duration::from_millis(50));
+    assert!(!app.is_worker_running());
+    assert_eq!(app.status_text, "Disconnected");
+}
+
+#[test]
+fn test_worker_stream_transient_error_backoff_sleep() {
+    let (_cmd_tx, cmd_rx) = mpsc::channel();
+    let (status_tx, status_rx) = mpsc::channel();
+
+    let mut backoff_sleeps = Vec::new();
+
+    run_worker_stream(
+        cmd_rx,
+        status_tx,
+        WorkerMessage::SetColor((255, 0, 0)),
+        Duration::from_millis(5),
+        |_frame| Err(io::Error::from_raw_os_error(libc::EPIPE)),
+        |d| backoff_sleeps.push(d),
+    );
+
+    // 9 retries before the 10th failure terminates the loop
+    assert_eq!(backoff_sleeps.len(), 9);
+    for (idx, duration) in backoff_sleeps.iter().enumerate() {
+        assert_eq!(*duration, Duration::from_millis(10 * (idx as u64 + 1)));
+    }
+
+    let mut errors = Vec::new();
+    while let Ok(status) = status_rx.try_recv() {
+        if let WorkerStatus::Error(err) = status {
+            errors.push(err);
+        }
+    }
+    assert!(!errors.is_empty());
+    assert!(errors[0].contains("after 10 retries"));
+}
+
+#[test]
+fn test_worker_fake_resolver_reconnects_and_resumes_sends() {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (status_tx, status_rx) = mpsc::channel();
+
+    let resolve_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let resolve_attempts_clone = resolve_attempts.clone();
+    let fake_resolver = move || {
+        let count = resolve_attempts_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if count < 3 {
+            None
+        } else {
+            Some(PathBuf::from("/dev/fake_hidraw1"))
+        }
+    };
+
+    let open_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let open_attempts_clone = open_attempts.clone();
+    let fake_opener = move |path: &PathBuf| {
+        open_attempts_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(path, &PathBuf::from("/dev/fake_hidraw1"));
+        Ok(())
+    };
+
+    let sent_frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sent_frames_clone = sent_frames.clone();
+    let fake_sender = move |_dev: &mut (), frame: &[u8; aula_f75::proto::FRAME_LEN]| {
+        sent_frames_clone.lock().unwrap().push(*frame);
+        Ok(())
+    };
+
+    let handle = std::thread::spawn(move || {
+        run_worker_reconnect_loop(
+            cmd_rx,
+            status_tx,
+            WorkerMessage::SetColor((12, 34, 56)),
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            fake_resolver,
+            fake_opener,
+            fake_sender,
+            |_| {},
+        );
+    });
+
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(500) {
+        if !sent_frames.lock().unwrap().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    assert!(
+        !sent_frames.lock().unwrap().is_empty(),
+        "Worker failed to send frames after resolver succeeded"
+    );
+
+    cmd_tx.send(WorkerMessage::Stop).unwrap();
+    handle.join().expect("Worker thread panicked");
+
+    let mut statuses = Vec::new();
+    while let Ok(s) = status_rx.try_recv() {
+        statuses.push(s);
+    }
+
+    assert!(
+        statuses.contains(&WorkerStatus::Connecting),
+        "Expected WorkerStatus::Connecting while resolver was failing"
+    );
+    assert!(
+        statuses.contains(&WorkerStatus::Running(PathBuf::from("/dev/fake_hidraw1"))),
+        "Expected WorkerStatus::Running when device resolved"
+    );
+    assert_eq!(statuses.last(), Some(&WorkerStatus::Stopped));
+    assert!(resolve_attempts.load(std::sync::atomic::Ordering::SeqCst) >= 4);
+    assert!(open_attempts.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn test_start_when_worker_alive_does_not_duplicate() {
+    let mut app = AulaF75App::default();
+
+    // Start worker first time
+    app.start_worker(WorkerMessage::SetColor((255, 0, 0)));
+    assert!(app.is_worker_running());
+    let thread_id_1 = app.worker_handle.as_ref().unwrap().thread().id();
+
+    // Attempt to start worker again while it is already running
+    app.start_worker(WorkerMessage::SetColor((0, 255, 0)));
+    assert!(app.is_worker_running());
+    let thread_id_2 = app.worker_handle.as_ref().unwrap().thread().id();
+
+    // Worker thread must NOT be duplicated or respawned
+    assert_eq!(thread_id_1, thread_id_2);
+
+    // Clean up worker
+    app.stop_worker();
+    assert!(!app.is_worker_running());
+
+    // Calling start_worker after stopping should respawn a fresh thread
+    app.start_worker(WorkerMessage::SetColor((0, 0, 255)));
+    assert!(app.is_worker_running());
+    let thread_id_3 = app.worker_handle.as_ref().unwrap().thread().id();
+    assert_ne!(thread_id_1, thread_id_3);
+
+    app.stop_worker();
+    assert!(!app.is_worker_running());
+}
+

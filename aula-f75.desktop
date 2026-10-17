@@ -7,3 +7,4 @@ Icon=keyboard
 Terminal=false
 Categories=Utility;
 Keywords=keyboard;rgb;lighting;aula;f75;
+StartupWMClass=aula-f75

@@ -257,7 +257,11 @@ cargo run --bin aula-f75-gui
 - **Lighting Profiles Panel**: Integrated profiles management interface with profile dropdown selector, instant **Apply** button, **Delete** button, and **Save Profile** input capturing the active effect, color, and brightness into a local flat file preset without cloud or vendor dependencies.
 - **Non-Blocking Streaming Worker**: Direct Report 6 frames are streamed at ~25 Hz (`Duration::from_millis(40)`) for fluid animations and ~1.5 Hz (`KEEPALIVE_HZ`) for solid keepalive on a dedicated background thread with transient error retry (`EPIPE`, `ETIMEDOUT`). The UI rendering thread is never blocked.
 - **Start / Stop Controls**: Dedicated "Start Streaming" and "Stop / Off" buttons with live footer reporting active stream name, estimated tick rate, and hardware communication status.
-- **Clean Lifecycle**: Window close signals worker termination, joins the thread, and cleanly drops the device descriptor.
+- **Clean Lifecycle**: Window close signals worker termination and cleanly drops the device descriptor without blocking the UI thread.
+
+### Troubleshooting
+
+- **Unresponsive Window Dialog ("Application is not responding")**: Direct USB HID communication executes exclusively on a dedicated background worker thread with retry backoff and never blocks the UI rendering thread. If the desktop environment ever displays an "Application is not responding" dialog, close the window, unplug and replug the keyboard's USB cable, and reopen `aula-f75-gui`. If the issue persists, please report it along with your desktop environment details (GNOME/KDE, Wayland/X11) and kernel version.
 
 > [!NOTE]
 > **CUSTOM Mode Requirement**: The physical keyboard must be toggled into its onboard "Custom" / user static RGB mode (via onboard Fn shortcuts) for software-driven colors to display.
