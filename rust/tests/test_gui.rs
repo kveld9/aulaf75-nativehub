@@ -122,6 +122,15 @@ fn test_worker_status_channel_shapes() {
     tx.send(WorkerStatus::Connecting).unwrap();
     assert_eq!(rx.recv().unwrap(), WorkerStatus::Connecting);
 
+    tx.send(WorkerStatus::Connected(PathBuf::from("/dev/hidraw1"))).unwrap();
+    match rx.recv().unwrap() {
+        WorkerStatus::Connected(p) => assert_eq!(p, PathBuf::from("/dev/hidraw1")),
+        _ => panic!("Expected WorkerStatus::Connected"),
+    }
+
+    tx.send(WorkerStatus::Disconnected).unwrap();
+    assert_eq!(rx.recv().unwrap(), WorkerStatus::Disconnected);
+
     tx.send(WorkerStatus::Stopped).unwrap();
     assert_eq!(rx.recv().unwrap(), WorkerStatus::Stopped);
 }
@@ -282,7 +291,7 @@ fn test_gui_app_startup_never_blocks_or_queries_hardware() {
     // Startup must complete in < 50ms without performing USB or sysfs discovery
     assert!(elapsed < Duration::from_millis(50));
     assert_eq!(app.control_node_path, None);
-    assert_eq!(app.status_text, "Device not connected");
+    assert_eq!(app.status_text, "Connecting...");
     assert!(!app.is_worker_running());
     assert!(app.last_error.is_none());
 }
@@ -453,6 +462,7 @@ fn test_worker_fake_resolver_reconnects_and_resumes_sends() {
     );
 
     cmd_tx.send(WorkerMessage::Stop).unwrap();
+    drop(cmd_tx);
     handle.join().expect("Worker thread panicked");
 
     let mut statuses = Vec::new();

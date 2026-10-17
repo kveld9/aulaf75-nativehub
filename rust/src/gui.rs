@@ -61,6 +61,12 @@ pub enum WorkerMessage {
 pub enum WorkerStatus {
     /// Worker is waiting or retrying to connect/reconnect to device node.
     Connecting,
+    /// Worker successfully opened device node in idle/connect-only mode.
+    Connected(PathBuf),
+    /// Alias variant for Connected state in idle-connected mode.
+    IdleConnected(PathBuf),
+    /// Worker lost connection to device node.
+    Disconnected,
     /// Worker successfully opened device node and entered keepalive loop.
     Running(PathBuf),
     /// Worker stopped execution cleanly.
@@ -475,10 +481,10 @@ fn render_keys_frame(
 /// When no device is open (initial startup, unplug, or communication error),
 /// retries `resolve_fn` at `reconnect_interval` (~2s in production) and resumes streaming
 /// automatically with the current parameters when the device reappears.
-pub fn run_worker_reconnect_loop<R, O, D, F, S>(
+pub fn run_worker_reconnect_loop<R, O, D, F, S, I>(
     rx: Receiver<WorkerMessage>,
     status_tx: Sender<WorkerStatus>,
-    initial_cmd: WorkerMessage,
+    initial_cmd: I,
     reconnect_interval: Duration,
     keepalive_interval: Duration,
     mut resolve_fn: R,
@@ -490,6 +496,7 @@ pub fn run_worker_reconnect_loop<R, O, D, F, S>(
     O: FnMut(&PathBuf) -> Result<D, io::Error>,
     F: FnMut(&mut D, &[u8; proto::FRAME_LEN]) -> Result<(), io::Error>,
     S: FnMut(Duration),
+    I: Into<Option<WorkerMessage>>,
 {
     struct ChildGuard(std::process::Child);
     impl Drop for ChildGuard {
@@ -499,31 +506,26 @@ pub fn run_worker_reconnect_loop<R, O, D, F, S>(
         }
     }
 
-    let (mut current_effect, mut current_brightness, mut current_keys, mut current_music) =
-        match initial_cmd {
-            WorkerMessage::SetColor(rgb) => {
-                (Effect::Solid(RGB(rgb.0, rgb.1, rgb.2)), 1.0f32, None, None)
+    let (mut current_effect, mut current_brightness, mut current_keys, mut current_music, mut is_idle) =
+        match initial_cmd.into() {
+            Some(WorkerMessage::SetColor(rgb)) => (
+                Effect::Solid(RGB(rgb.0, rgb.1, rgb.2)),
+                1.0f32,
+                None,
+                None,
+                false,
+            ),
+            Some(WorkerMessage::SetEffect { effect, brightness }) => {
+                (effect, brightness, None, None, false)
             }
-            WorkerMessage::SetEffect { effect, brightness } => (effect, brightness, None, None),
-            WorkerMessage::SetKeyFrame(keys) => (Effect::Off, 1.0f32, Some(keys), None),
-            WorkerMessage::SetMusic { mode, color, gain } => {
-                (Effect::Off, 1.0f32, None, Some((mode, color, gain)))
+            Some(WorkerMessage::SetKeyFrame(keys)) => {
+                (Effect::Off, 1.0f32, Some(keys), None, false)
             }
-            WorkerMessage::Off => {
-                if let Some(node) = resolve_fn() {
-                    if let Ok(mut dev) = open_fn(&node) {
-                        if let Ok(off_frame) = proto::build_direct_frame((0, 0, 0)) {
-                            let _ = send_fn(&mut dev, &off_frame);
-                        }
-                    }
-                }
-                let _ = status_tx.send(WorkerStatus::Stopped);
-                return;
+            Some(WorkerMessage::SetMusic { mode, color, gain }) => {
+                (Effect::Off, 1.0f32, None, Some((mode, color, gain)), false)
             }
-            WorkerMessage::Stop => {
-                let _ = status_tx.send(WorkerStatus::Stopped);
-                return;
-            }
+            Some(WorkerMessage::Off) => (Effect::Off, 1.0f32, None, None, true),
+            Some(WorkerMessage::Stop) | None => (Effect::Off, 1.0f32, None, None, true),
         };
 
     let mut active_device: Option<(PathBuf, D)> = None;
@@ -549,7 +551,11 @@ pub fn run_worker_reconnect_loop<R, O, D, F, S>(
             if let Some(node) = resolve_fn() {
                 match open_fn(&node) {
                     Ok(dev) => {
-                        let _ = status_tx.send(WorkerStatus::Running(node.clone()));
+                        if is_idle {
+                            let _ = status_tx.send(WorkerStatus::Connected(node.clone()));
+                        } else {
+                            let _ = status_tx.send(WorkerStatus::Running(node.clone()));
+                        }
                         active_device = Some((node, dev));
                         reported_connecting = false;
                         consecutive_failures = 0;
@@ -571,28 +577,38 @@ pub fn run_worker_reconnect_loop<R, O, D, F, S>(
                     let poll_step = remaining.min(Duration::from_millis(50));
                     match rx.recv_timeout(poll_step) {
                         Ok(WorkerMessage::Stop) => {
-                            break 'outer;
+                            is_idle = true;
+                            current_music = None;
+                            current_keys = None;
+                            current_effect = Effect::Off;
                         }
                         Ok(WorkerMessage::Off) => {
-                            break 'outer;
+                            is_idle = true;
+                            current_music = None;
+                            current_keys = None;
+                            current_effect = Effect::Off;
                         }
                         Ok(WorkerMessage::SetColor(rgb)) => {
+                            is_idle = false;
                             current_music = None;
                             current_keys = None;
                             current_effect = Effect::Solid(RGB(rgb.0, rgb.1, rgb.2));
                             current_brightness = 1.0;
                         }
                         Ok(WorkerMessage::SetEffect { effect, brightness }) => {
+                            is_idle = false;
                             current_music = None;
                             current_keys = None;
                             current_effect = effect;
                             current_brightness = brightness;
                         }
                         Ok(WorkerMessage::SetKeyFrame(keys)) => {
+                            is_idle = false;
                             current_music = None;
                             current_keys = Some(keys);
                         }
                         Ok(WorkerMessage::SetMusic { mode, color, gain }) => {
+                            is_idle = false;
                             current_keys = None;
                             current_music = Some((mode, color, gain));
                         }
@@ -606,9 +622,93 @@ pub fn run_worker_reconnect_loop<R, O, D, F, S>(
             }
         }
 
+        // 2. If in idle/connect-only mode, send NO frames and wait for commands or device disconnect
+        if is_idle {
+            let wait_start = Instant::now();
+            while wait_start.elapsed() < reconnect_interval {
+                let remaining = reconnect_interval.saturating_sub(wait_start.elapsed());
+                let poll_step = remaining.min(Duration::from_millis(50));
+                match rx.recv_timeout(poll_step) {
+                    Ok(WorkerMessage::SetColor(rgb)) => {
+                        is_idle = false;
+                        current_music = None;
+                        current_keys = None;
+                        current_effect = Effect::Solid(RGB(rgb.0, rgb.1, rgb.2));
+                        current_brightness = 1.0;
+                        if let Some((ref node, _)) = active_device {
+                            let _ = status_tx.send(WorkerStatus::Running(node.clone()));
+                        }
+                        continue 'outer;
+                    }
+                    Ok(WorkerMessage::SetEffect { effect, brightness }) => {
+                        is_idle = false;
+                        current_music = None;
+                        current_keys = None;
+                        current_effect = effect;
+                        current_brightness = brightness;
+                        if let Some((ref node, _)) = active_device {
+                            let _ = status_tx.send(WorkerStatus::Running(node.clone()));
+                        }
+                        continue 'outer;
+                    }
+                    Ok(WorkerMessage::SetKeyFrame(keys)) => {
+                        is_idle = false;
+                        current_music = None;
+                        current_keys = Some(keys);
+                        if let Some((ref node, _)) = active_device {
+                            let _ = status_tx.send(WorkerStatus::Running(node.clone()));
+                        }
+                        continue 'outer;
+                    }
+                    Ok(WorkerMessage::SetMusic { mode, color, gain }) => {
+                        is_idle = false;
+                        current_keys = None;
+                        current_music = Some((mode, color, gain));
+                        if let Some((ref node, _)) = active_device {
+                            let _ = status_tx.send(WorkerStatus::Running(node.clone()));
+                        }
+                        continue 'outer;
+                    }
+                    Ok(WorkerMessage::Off) => {
+                        if let Some((_, ref mut dev)) = active_device {
+                            if let Ok(off_frame) = proto::build_direct_frame((0, 0, 0)) {
+                                let _ = send_fn(dev, &off_frame);
+                            }
+                        }
+                        if let Some((ref node, _)) = active_device {
+                            let _ = status_tx.send(WorkerStatus::IdleConnected(node.clone()));
+                        }
+                    }
+                    Ok(WorkerMessage::Stop) => {
+                        if let Some((ref node, _)) = active_device {
+                            let _ = status_tx.send(WorkerStatus::IdleConnected(node.clone()));
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        break 'outer;
+                    }
+                }
+            }
+
+            // Check if device is still connected
+            if let Some((ref current_node, _)) = active_device {
+                let still_present = match resolve_fn() {
+                    Some(ref node) => node == current_node,
+                    None => false,
+                };
+                if !still_present {
+                    let _ = status_tx.send(WorkerStatus::Disconnected);
+                    active_device = None;
+                    reported_connecting = false;
+                }
+            }
+            continue 'outer;
+        }
+
         let t = stream_start.elapsed().as_secs_f64();
 
-        // 2. Audio monitor child process for music mode
+        // 3. Audio monitor child process for music mode
         if let Some((_, _, gain)) = current_music {
             if music_child.is_none() {
                 match music::spawn_monitor() {
@@ -676,7 +776,7 @@ pub fn run_worker_reconnect_loop<R, O, D, F, S>(
             }
         }
 
-        // 3. Build RGB frame
+        // 4. Build RGB frame
         let frame = if let Some((mode, color, _)) = current_music {
             if music_sample_buf.len() >= 1024 {
                 let block: Vec<f32> = music_sample_buf.iter().copied().collect();
@@ -725,7 +825,7 @@ pub fn run_worker_reconnect_loop<R, O, D, F, S>(
             }
         };
 
-        // 4. Transmit frame to open device
+        // 5. Transmit frame to open device
         if let Some((_, ref mut dev)) = active_device {
             match send_fn(dev, &frame) {
                 Ok(()) => {
@@ -741,6 +841,7 @@ pub fn run_worker_reconnect_loop<R, O, D, F, S>(
                                 "Device communication failed after 10 retries: {}",
                                 e
                             )));
+                            let _ = status_tx.send(WorkerStatus::Disconnected);
                             // Close device handle and transition to reconnecting
                             active_device = None;
                             consecutive_failures = 0;
@@ -753,6 +854,7 @@ pub fn run_worker_reconnect_loop<R, O, D, F, S>(
                             "Device communication error: {}",
                             e
                         )));
+                        let _ = status_tx.send(WorkerStatus::Disconnected);
                         // Fatal error (e.g. ENODEV on unplug): close and reconnect
                         active_device = None;
                         consecutive_failures = 0;
@@ -761,7 +863,7 @@ pub fn run_worker_reconnect_loop<R, O, D, F, S>(
             }
         }
 
-        // 5. Calculate tick interval and process channel messages
+        // 6. Calculate tick interval and process channel messages
         let tick_interval = if current_music.is_some() {
             Duration::from_millis(50)
         } else if current_keys.is_some() {
@@ -811,11 +913,19 @@ pub fn run_worker_reconnect_loop<R, O, D, F, S>(
                             let _ = send_fn(dev, &off_frame);
                         }
                     }
-                    break 'outer;
+                    is_idle = true;
+                    if let Some((ref node, _)) = active_device {
+                        let _ = status_tx.send(WorkerStatus::IdleConnected(node.clone()));
+                    }
+                    break;
                 }
                 Ok(WorkerMessage::Stop) => {
                     music_child = None;
-                    break 'outer;
+                    is_idle = true;
+                    if let Some((ref node, _)) = active_device {
+                        let _ = status_tx.send(WorkerStatus::IdleConnected(node.clone()));
+                    }
+                    break;
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
@@ -831,10 +941,10 @@ pub fn run_worker_reconnect_loop<R, O, D, F, S>(
 }
 
 /// Production worker thread runner that manages device handle lifetime.
-fn run_worker_thread(
+fn run_worker_thread<I: Into<Option<WorkerMessage>>>(
     rx: Receiver<WorkerMessage>,
     status_tx: Sender<WorkerStatus>,
-    initial_cmd: WorkerMessage,
+    initial_cmd: I,
 ) {
     let keepalive_interval = Duration::from_secs_f64(1.0 / proto::KEEPALIVE_HZ);
     run_worker_reconnect_loop(
@@ -915,7 +1025,7 @@ impl Default for AulaF75App {
             brightness: 1.0,
             selected_effect: "Solid".to_string(),
             control_node_path: None,
-            status_text: "Device not connected".to_string(),
+            status_text: "Connecting...".to_string(),
             last_error: None,
             saved_profiles: saved,
             selected_profile: initial_selected,
@@ -932,9 +1042,38 @@ impl Default for AulaF75App {
 }
 
 impl AulaF75App {
-    /// Create a new instance for eframe initialization.
+    /// Create a new instance for eframe initialization and spawn worker in connect-only mode.
     pub fn new(_cc: &eframe::CreationContext) -> Self {
-        Self::default()
+        let mut app = Self::default();
+        app.start_worker(None);
+        app
+    }
+
+    /// Create a new instance with custom/fake worker runners (for hardware-free testing).
+    pub fn new_with_runner<R, O, D, F, S>(
+        reconnect_interval: Duration,
+        resolve_fn: R,
+        open_fn: O,
+        send_fn: F,
+        sleep_fn: S,
+    ) -> Self
+    where
+        R: FnMut() -> Option<PathBuf> + Send + 'static,
+        O: FnMut(&PathBuf) -> Result<D, io::Error> + Send + 'static,
+        F: FnMut(&mut D, &[u8; proto::FRAME_LEN]) -> Result<(), io::Error> + Send + 'static,
+        S: FnMut(Duration) + Send + 'static,
+        D: Send + 'static,
+    {
+        let mut app = Self::default();
+        app.start_worker_with(
+            None,
+            reconnect_interval,
+            resolve_fn,
+            open_fn,
+            send_fn,
+            sleep_fn,
+        );
+        app
     }
 
     /// Check if the streaming worker thread is active.
@@ -943,6 +1082,11 @@ impl AulaF75App {
             Some(ref handle) => !handle.is_finished(),
             None => false,
         }
+    }
+
+    /// Check if lighting streaming is active (solid, effect, or music).
+    pub fn is_streaming(&self) -> bool {
+        self.is_worker_running() && self.state.mode != GuiLightingMode::Off
     }
 
     /// Check if music reactive mode is actively streaming.
@@ -972,6 +1116,9 @@ impl AulaF75App {
     fn handle_worker_status(&mut self, status: WorkerStatus) {
         match status {
             WorkerStatus::Connecting => self.on_status_connecting(),
+            WorkerStatus::Connected(path) => self.on_status_connected(path),
+            WorkerStatus::IdleConnected(path) => self.on_status_idle_connected(path),
+            WorkerStatus::Disconnected => self.on_status_disconnected(),
             WorkerStatus::Running(path) => self.on_status_running(path),
             WorkerStatus::Stopped => self.on_status_stopped(),
             WorkerStatus::Error(err) => self.on_status_error(err),
@@ -982,6 +1129,24 @@ impl AulaF75App {
     fn on_status_connecting(&mut self) {
         self.control_node_path = None;
         self.status_text = "Connecting...".to_string();
+    }
+
+    fn on_status_connected(&mut self, path: PathBuf) {
+        self.control_node_path = Some(path.clone());
+        self.status_text = format!("Connected ({})", path.display());
+        self.last_error = None;
+    }
+
+    fn on_status_idle_connected(&mut self, path: PathBuf) {
+        self.control_node_path = Some(path);
+        self.status_text = "Connected (idle)".to_string();
+        self.last_error = None;
+    }
+
+    fn on_status_disconnected(&mut self) {
+        self.control_node_path = None;
+        self.status_text = "Disconnected".to_string();
+        self.last_music_bands.clear();
     }
 
     fn on_status_running(&mut self, path: PathBuf) {
@@ -1059,7 +1224,7 @@ impl AulaF75App {
         self.color_rgb = srgb;
         self.hex_input = format!("{:02X}{:02X}{:02X}", srgb[0], srgb[1], srgb[2]);
         self.hex_error = None;
-        if self.is_worker_running() {
+        if self.is_streaming() {
             if self.is_music_running() {
                 self.start_music();
             } else if self.selected_effect == "Solid" || self.selected_effect == "Breathe" {
@@ -1105,19 +1270,25 @@ impl AulaF75App {
     /// Handler for "Off" action button click.
     pub fn on_off_clicked(&mut self) {
         self.selected_effect = "Off".to_string();
-        let msg = self.state.transition_to_off();
+        let msg = self.state.transition_to_stop();
         if let Some(ref tx) = self.worker_tx {
             let _ = tx.send(msg);
         } else {
-            self.start_worker(WorkerMessage::Off);
+            self.start_worker(WorkerMessage::Stop);
+        }
+        if self.control_node_path.is_some() {
+            self.status_text = "Connected (idle)".to_string();
         }
     }
 
-    /// Spawn worker thread with initial command.
-    pub fn start_worker(&mut self, initial_cmd: WorkerMessage) {
+    /// Spawn worker thread with initial command or in idle mode if None.
+    pub fn start_worker<I: Into<Option<WorkerMessage>>>(&mut self, initial_cmd: I) {
+        let cmd = initial_cmd.into();
         if self.is_worker_running() {
             if let Some(ref tx) = self.worker_tx {
-                let _ = tx.send(initial_cmd);
+                if let Some(msg) = cmd {
+                    let _ = tx.send(msg);
+                }
                 return;
             }
         }
@@ -1127,7 +1298,59 @@ impl AulaF75App {
         let (tx_status, rx_status) = mpsc::channel();
 
         let handle = thread::spawn(move || {
-            run_worker_thread(rx_cmd, tx_status, initial_cmd);
+            run_worker_thread(rx_cmd, tx_status, cmd);
+        });
+
+        self.worker_tx = Some(tx_cmd);
+        self.status_rx = Some(rx_status);
+        self.worker_handle = Some(handle);
+        self.last_error = None;
+    }
+
+    /// Spawn worker thread with custom injectable runners (for hardware-free testing).
+    pub fn start_worker_with<R, O, D, F, S, I>(
+        &mut self,
+        initial_cmd: I,
+        reconnect_interval: Duration,
+        resolve_fn: R,
+        open_fn: O,
+        send_fn: F,
+        sleep_fn: S,
+    ) where
+        R: FnMut() -> Option<PathBuf> + Send + 'static,
+        O: FnMut(&PathBuf) -> Result<D, io::Error> + Send + 'static,
+        F: FnMut(&mut D, &[u8; proto::FRAME_LEN]) -> Result<(), io::Error> + Send + 'static,
+        S: FnMut(Duration) + Send + 'static,
+        D: Send + 'static,
+        I: Into<Option<WorkerMessage>>,
+    {
+        let cmd = initial_cmd.into();
+        if self.is_worker_running() {
+            if let Some(ref tx) = self.worker_tx {
+                if let Some(msg) = cmd {
+                    let _ = tx.send(msg);
+                }
+                return;
+            }
+        }
+        self.stop_worker();
+
+        let (tx_cmd, rx_cmd) = mpsc::channel();
+        let (tx_status, rx_status) = mpsc::channel();
+        let keepalive_interval = Duration::from_secs_f64(1.0 / proto::KEEPALIVE_HZ);
+
+        let handle = thread::spawn(move || {
+            run_worker_reconnect_loop(
+                rx_cmd,
+                tx_status,
+                cmd,
+                reconnect_interval,
+                keepalive_interval,
+                resolve_fn,
+                open_fn,
+                send_fn,
+                sleep_fn,
+            );
         });
 
         self.worker_tx = Some(tx_cmd);
@@ -1310,16 +1533,16 @@ impl eframe::App for AulaF75App {
 
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
-                        let (indicator_color, indicator_text) = if self.is_worker_running() {
-                            if self.control_node_path.is_some() {
+                        let (indicator_color, indicator_text) = if self.control_node_path.is_some() {
+                            if self.is_streaming() {
                                 (egui::Color32::from_rgb(46, 204, 113), "Streaming Active")
                             } else {
-                                (egui::Color32::from_rgb(241, 196, 15), "Connecting...")
+                                (egui::Color32::from_rgb(46, 204, 113), "Connected (idle)")
                             }
-                        } else if self.control_node_path.is_some() {
-                            (egui::Color32::from_rgb(241, 196, 15), "Device Connected")
-                        } else {
+                        } else if self.status_text == "Disconnected" {
                             (egui::Color32::from_rgb(231, 76, 60), "Disconnected")
+                        } else {
+                            (egui::Color32::from_rgb(241, 196, 15), "Connecting...")
                         };
 
                         ui.colored_label(indicator_color, "●");
@@ -1333,6 +1556,11 @@ impl eframe::App for AulaF75App {
 
                     if let Some(ref path) = self.control_node_path {
                         ui.label(format!("Node: {}", path.display()));
+                    } else if self.status_text == "Connecting..." {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(241, 196, 15),
+                            "Node: Searching...",
+                        );
                     } else {
                         ui.colored_label(
                             egui::Color32::from_rgb(231, 76, 60),
@@ -1372,7 +1600,7 @@ impl eframe::App for AulaF75App {
                                     .selectable_value(&mut self.selected_effect, eff.to_string(), eff)
                                     .clicked()
                                 {
-                                    if self.is_worker_running() {
+                                    if self.is_streaming() {
                                         self.dispatch_current_effect();
                                     }
                                 }
@@ -1427,7 +1655,7 @@ impl eframe::App for AulaF75App {
                             if let Ok(parsed) = parse_color_hex(&self.hex_input) {
                                 self.color_rgb = [parsed.0, parsed.1, parsed.2];
                                 self.hex_error = None;
-                                if self.is_worker_running() {
+                                if self.is_streaming() {
                                     self.dispatch_current_effect();
                                 }
                             } else if !self.hex_input.is_empty() {
@@ -1453,7 +1681,7 @@ impl eframe::App for AulaF75App {
                         .add(egui::Slider::new(&mut self.brightness, 0.0..=1.0).text(pct_label))
                         .changed()
                     {
-                        if self.is_worker_running() {
+                        if self.is_streaming() {
                             self.dispatch_current_effect();
                         }
                     }
@@ -1633,7 +1861,7 @@ impl eframe::App for AulaF75App {
 
             // Status footer
             ui.group(|ui| {
-                let tick_rate_label = if self.is_worker_running() {
+                let tick_rate_label = if self.is_streaming() {
                     if self.is_music_running() {
                         "~20 Hz (audio stream)"
                     } else {
@@ -1647,7 +1875,7 @@ impl eframe::App for AulaF75App {
                     "0 Hz (idle)"
                 };
 
-                let active_name = if self.is_worker_running() {
+                let active_name = if self.is_streaming() {
                     if self.is_music_running() {
                         format!("Music ({})", self.music_mode)
                     } else {
@@ -1665,7 +1893,7 @@ impl eframe::App for AulaF75App {
         });
 
         // Request repaint depending on streaming state
-        if self.is_worker_running() {
+        if self.is_streaming() {
             let repaint_interval = if self.is_music_running() {
                 Duration::from_millis(40)
             } else if self.selected_effect == "Solid" {
@@ -1674,6 +1902,8 @@ impl eframe::App for AulaF75App {
                 Duration::from_millis(40)
             };
             ctx.request_repaint_after(repaint_interval);
+        } else if self.is_worker_running() {
+            ctx.request_repaint_after(Duration::from_millis(500));
         }
     }
 }
