@@ -15,6 +15,7 @@ use std::time::Duration;
 use eframe::egui;
 
 pub use crate::cli::parse_color_hex;
+use crate::cli::profile::{self, Profile};
 use crate::device;
 use crate::effects::{self, Effect, RGB};
 use crate::proto;
@@ -39,6 +40,8 @@ pub enum WorkerMessage {
         effect: Effect,
         brightness: f32,
     },
+    /// Stream a per-key direct RGB frame lighting specific keys.
+    SetKeyFrame(Vec<(String, (u8, u8, u8))>),
     /// Transmit all-zero off frame and cleanly stop the keepalive loop.
     Off,
     /// Immediately terminate keepalive loop and close device descriptor.
@@ -129,9 +132,10 @@ pub fn run_worker_stream<F, S>(
     F: FnMut(&[u8; proto::FRAME_LEN]) -> Result<(), std::io::Error>,
     S: FnMut(Duration),
 {
-    let (mut current_effect, mut current_brightness) = match initial_cmd {
-        WorkerMessage::SetColor(rgb) => (Effect::Solid(RGB(rgb.0, rgb.1, rgb.2)), 1.0f32),
-        WorkerMessage::SetEffect { effect, brightness } => (effect, brightness),
+    let (mut current_effect, mut current_brightness, mut current_keys) = match initial_cmd {
+        WorkerMessage::SetColor(rgb) => (Effect::Solid(RGB(rgb.0, rgb.1, rgb.2)), 1.0f32, None),
+        WorkerMessage::SetEffect { effect, brightness } => (effect, brightness, None),
+        WorkerMessage::SetKeyFrame(keys) => (Effect::Off, 1.0f32, Some(keys)),
         WorkerMessage::Off => {
             if let Ok(off_frame) = proto::build_direct_frame((0, 0, 0)) {
                 let _ = send_fn(&off_frame);
@@ -151,34 +155,48 @@ pub fn run_worker_stream<F, S>(
 
     'outer: loop {
         let t = stream_start.elapsed().as_secs_f64();
-        let frame = match &current_effect {
-            Effect::Solid(rgb) => {
-                let scaled_rgb = rgb.scale(current_brightness).to_tuple();
-                match proto::build_direct_frame(scaled_rgb) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        let _ = status_tx.send(WorkerStatus::Error(format!("Frame build error: {}", e)));
-                        break;
-                    }
+        let frame = if let Some(ref keys) = current_keys {
+            let borrowed: Vec<(&str, (u8, u8, u8))> =
+                keys.iter().map(|(k, c)| (k.as_str(), *c)).collect();
+            match proto::build_key_frame(&borrowed) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ =
+                        status_tx.send(WorkerStatus::Error(format!("Frame build error: {}", e)));
+                    break;
                 }
             }
-            Effect::Off => {
-                match proto::build_direct_frame((0, 0, 0)) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        let _ = status_tx.send(WorkerStatus::Error(format!("Frame build error: {}", e)));
-                        break;
+        } else {
+            match &current_effect {
+                Effect::Solid(rgb) => {
+                    let scaled_rgb = rgb.scale(current_brightness).to_tuple();
+                    match proto::build_direct_frame(scaled_rgb) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            let _ = status_tx
+                                .send(WorkerStatus::Error(format!("Frame build error: {}", e)));
+                            break;
+                        }
                     }
                 }
-            }
-            dynamic_effect => {
-                let pairs = effects::render(dynamic_effect, t, &key_slots);
-                let scaled = effects::apply_brightness(&pairs, current_brightness);
-                match proto::build_slot_frame(&scaled) {
+                Effect::Off => match proto::build_direct_frame((0, 0, 0)) {
                     Ok(f) => f,
                     Err(e) => {
-                        let _ = status_tx.send(WorkerStatus::Error(format!("Frame build error: {}", e)));
+                        let _ = status_tx
+                            .send(WorkerStatus::Error(format!("Frame build error: {}", e)));
                         break;
+                    }
+                },
+                dynamic_effect => {
+                    let pairs = effects::render(dynamic_effect, t, &key_slots);
+                    let scaled = effects::apply_brightness(&pairs, current_brightness);
+                    match proto::build_slot_frame(&scaled) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            let _ = status_tx
+                                .send(WorkerStatus::Error(format!("Frame build error: {}", e)));
+                            break;
+                        }
                     }
                 }
             }
@@ -209,9 +227,13 @@ pub fn run_worker_stream<F, S>(
             }
         }
 
-        let tick_interval = match current_effect {
-            Effect::Solid(_) => interval,
-            _ => Duration::from_millis(40),
+        let tick_interval = if current_keys.is_some() {
+            interval
+        } else {
+            match current_effect {
+                Effect::Solid(_) => interval,
+                _ => Duration::from_millis(40),
+            }
         };
 
         let start = std::time::Instant::now();
@@ -220,12 +242,18 @@ pub fn run_worker_stream<F, S>(
             let poll_step = remaining.min(Duration::from_millis(10));
             match rx.recv_timeout(poll_step) {
                 Ok(WorkerMessage::SetColor(new_color)) => {
+                    current_keys = None;
                     current_effect = Effect::Solid(RGB(new_color.0, new_color.1, new_color.2));
                     break;
                 }
                 Ok(WorkerMessage::SetEffect { effect, brightness }) => {
+                    current_keys = None;
                     current_effect = effect;
                     current_brightness = brightness;
+                    break;
+                }
+                Ok(WorkerMessage::SetKeyFrame(keys)) => {
+                    current_keys = Some(keys);
                     break;
                 }
                 Ok(WorkerMessage::Off) => {
@@ -317,6 +345,15 @@ pub struct AulaF75App {
     /// Last error encountered during device operations.
     pub last_error: Option<String>,
 
+    /// Saved profile names detected on disk.
+    pub saved_profiles: Vec<String>,
+    /// Selected profile name in the profiles combo box.
+    pub selected_profile: Option<String>,
+    /// Text input buffer for profile name when saving.
+    pub profile_name_input: String,
+    /// Feedback status message specific to profile operations.
+    pub profile_status: Option<String>,
+
     /// Channel sender to worker thread.
     worker_tx: Option<Sender<WorkerMessage>>,
     /// Channel receiver for status events from worker thread.
@@ -335,6 +372,9 @@ impl Default for AulaF75App {
             None => "Device not connected".to_string(),
         };
 
+        let saved = profile::list_profiles(None).unwrap_or_default();
+        let initial_selected = saved.first().cloned();
+
         Self {
             state: GuiState {
                 mode: GuiLightingMode::Off,
@@ -348,6 +388,10 @@ impl Default for AulaF75App {
             control_node_path: detected,
             status_text,
             last_error: None,
+            saved_profiles: saved,
+            selected_profile: initial_selected,
+            profile_name_input: String::new(),
+            profile_status: None,
             worker_tx: None,
             status_rx: None,
             worker_handle: None,
@@ -511,6 +555,143 @@ impl AulaF75App {
         }
         self.status_rx = None;
         self.state.mode = GuiLightingMode::Off;
+    }
+
+    /// Refresh the list of saved profiles from the config directory.
+    pub fn refresh_profiles(&mut self) {
+        match profile::list_profiles(None) {
+            Ok(list) => {
+                self.saved_profiles = list;
+                if let Some(ref sel) = self.selected_profile {
+                    if !self.saved_profiles.contains(sel) {
+                        self.selected_profile = self.saved_profiles.first().cloned();
+                    }
+                } else {
+                    self.selected_profile = self.saved_profiles.first().cloned();
+                }
+            }
+            Err(e) => {
+                self.profile_status = Some(format!("Error listing profiles: {}", e));
+            }
+        }
+    }
+
+    /// Apply a loaded profile configuration to GUI state and worker thread.
+    pub fn apply_profile(&mut self, prof: &Profile) {
+        if !prof.keys.is_empty() {
+            let msg = WorkerMessage::SetKeyFrame(prof.keys.clone());
+            if let Some(ref tx) = self.worker_tx {
+                let _ = tx.send(msg);
+            } else {
+                self.start_worker(msg);
+            }
+            let msg_text = format!("Profile '{}' applied ({} keys)", prof.name, prof.keys.len());
+            self.status_text = msg_text.clone();
+            self.profile_status = Some(msg_text);
+        } else {
+            let effect_name = match prof.effect.to_ascii_lowercase().as_str() {
+                "solid" => "Solid",
+                "rainbow" => "Rainbow",
+                "wave" => "Wave",
+                "breathe" => "Breathe",
+                "stars" => "Stars",
+                "off" => "Off",
+                _ => "Solid",
+            };
+            self.selected_effect = effect_name.to_string();
+            self.brightness = prof.brightness;
+            if let Some(c) = prof.color {
+                self.color_rgb = [c.0, c.1, c.2];
+                self.hex_input = format!("{:02X}{:02X}{:02X}", c.0, c.1, c.2);
+                self.hex_error = None;
+            }
+            self.dispatch_current_effect();
+            let msg_text = format!("Profile '{}' applied", prof.name);
+            self.status_text = msg_text.clone();
+            self.profile_status = Some(msg_text);
+        }
+    }
+
+    /// Apply the currently selected profile from the UI combo box.
+    pub fn on_apply_profile_clicked(&mut self) {
+        let sel = match self.selected_profile.clone() {
+            Some(s) => s,
+            None => {
+                self.profile_status = Some("Error: No profile selected to apply".to_string());
+                return;
+            }
+        };
+
+        match profile::load_profile(&sel, None) {
+            Ok(prof) => {
+                self.apply_profile(&prof);
+            }
+            Err(e) => {
+                self.profile_status = Some(format!("Error loading profile: {}", e));
+            }
+        }
+    }
+
+    /// Delete the currently selected profile.
+    pub fn on_delete_profile_clicked(&mut self) {
+        let sel = match self.selected_profile.clone() {
+            Some(s) => s,
+            None => {
+                self.profile_status = Some("Error: No profile selected to delete".to_string());
+                return;
+            }
+        };
+
+        match profile::delete_profile(&sel, None) {
+            Ok(()) => {
+                let msg = format!("Profile '{}' deleted", sel);
+                self.status_text = msg.clone();
+                self.profile_status = Some(msg);
+                self.selected_profile = None;
+                self.refresh_profiles();
+            }
+            Err(e) => {
+                self.profile_status = Some(format!("Error deleting profile: {}", e));
+            }
+        }
+    }
+
+    /// Save the current GUI configuration as a named profile.
+    pub fn save_current_profile(&mut self) {
+        let name = self.profile_name_input.trim().to_string();
+        if name.is_empty() {
+            self.profile_status = Some("Error: Profile name cannot be empty".to_string());
+            return;
+        }
+
+        let is_color_effect = self.selected_effect == "Solid" || self.selected_effect == "Breathe";
+        let color = if is_color_effect {
+            Some((self.color_rgb[0], self.color_rgb[1], self.color_rgb[2]))
+        } else {
+            None
+        };
+
+        let prof = Profile::new(
+            name.to_string(),
+            self.selected_effect.to_ascii_lowercase(),
+            color,
+            self.brightness,
+            Vec::new(),
+        );
+
+        match profile::save_profile(&prof, None) {
+            Ok(_) => {
+                let msg = format!("Profile '{}' saved", name);
+                self.status_text = msg.clone();
+                self.profile_status = Some(msg);
+                self.refresh_profiles();
+                self.selected_profile = Some(name.to_string());
+                self.profile_name_input.clear();
+            }
+            Err(e) => {
+                self.profile_status = Some(format!("Error saving profile: {}", e));
+            }
+        }
     }
 }
 
@@ -692,6 +873,62 @@ impl eframe::App for AulaF75App {
                         self.on_off_clicked();
                     }
                 });
+            });
+
+            ui.add_space(12.0);
+
+            // Lighting Profiles Panel
+            ui.heading("Lighting Profiles");
+            ui.add_space(8.0);
+
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Saved profiles:");
+                    let current_selection = self
+                        .selected_profile
+                        .as_deref()
+                        .unwrap_or("No profiles saved");
+
+                    egui::ComboBox::from_label("##profile_combo")
+                        .selected_text(current_selection)
+                        .show_ui(ui, |ui| {
+                            for p in &self.saved_profiles {
+                                ui.selectable_value(
+                                    &mut self.selected_profile,
+                                    Some(p.clone()),
+                                    p,
+                                );
+                            }
+                        });
+
+                    if ui.button("Apply").clicked() {
+                        self.on_apply_profile_clicked();
+                    }
+
+                    if ui.button("Delete").clicked() {
+                        self.on_delete_profile_clicked();
+                    }
+                });
+
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Save current as:");
+                    ui.text_edit_singleline(&mut self.profile_name_input);
+                    if ui.button("Save Profile").clicked() {
+                        self.save_current_profile();
+                    }
+                });
+
+                if let Some(ref status) = self.profile_status {
+                    ui.add_space(4.0);
+                    let color = if status.starts_with("Error") {
+                        egui::Color32::from_rgb(231, 76, 60)
+                    } else {
+                        egui::Color32::from_rgb(46, 204, 113)
+                    };
+                    ui.colored_label(color, status);
+                }
             });
 
             ui.add_space(12.0);

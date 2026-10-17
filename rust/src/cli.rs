@@ -11,6 +11,11 @@ use clap::{Parser, Subcommand};
 use crate::device::{self, DeviceInfo};
 use crate::proto;
 
+#[path = "profile.rs"]
+pub mod profile;
+
+pub use profile::Profile;
+
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
 extern "C" fn sigint_handler(_: libc::c_int) {
@@ -144,6 +149,52 @@ pub enum Commands {
     },
     /// List available host-rendered RGB lighting effects
     Effects,
+    /// Manage local lighting profiles (save, load, list, delete, show)
+    Profile {
+        #[command(subcommand)]
+        action: ProfileCommands,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum ProfileCommands {
+    /// Save a new lighting profile
+    Save {
+        /// Profile name
+        name: String,
+        /// Effect name (solid, rainbow, wave, breathe, stars, off)
+        #[arg(long)]
+        effect: String,
+        /// Base hex color string (e.g. 'ff0000', '#00ff00') for solid/breathe
+        #[arg(long)]
+        color: Option<String>,
+        /// Brightness multiplier (0.0 to 1.0)
+        #[arg(long, default_value_t = 1.0)]
+        brightness: f32,
+        /// Per-key color overrides in NAME=COLOR format (can be specified multiple times)
+        #[arg(long = "key", action = clap::ArgAction::Append)]
+        keys: Vec<String>,
+    },
+    /// Load and apply a lighting profile
+    Load {
+        /// Profile name
+        name: String,
+        /// Duration to maintain profile in seconds (0 or omitted = run until Ctrl+C)
+        #[arg(long)]
+        seconds: Option<f64>,
+    },
+    /// List all saved profiles
+    List,
+    /// Delete a saved profile
+    Delete {
+        /// Profile name
+        name: String,
+    },
+    /// Show details of a saved profile
+    Show {
+        /// Profile name
+        name: String,
+    },
 }
 
 /// List detected HID devices and flag known AULA hardware.
@@ -269,8 +320,8 @@ pub fn cmd_keys() -> i32 {
     0
 }
 
-/// Run per-key RGB lighting loop on the hardware interface 1 control node.
-pub fn run_key_lighting(name: &str, rgb: (u8, u8, u8), seconds: Option<f64>) -> i32 {
+/// Run per-key RGB lighting loop for multiple keys on the hardware interface 1 control node.
+pub fn run_keys_lighting(pairs: &[(&str, (u8, u8, u8))], seconds: Option<f64>) -> i32 {
     let node = match device::resolve_control_node() {
         Some(n) => n,
         None => {
@@ -291,7 +342,7 @@ pub fn run_key_lighting(name: &str, rgb: (u8, u8, u8), seconds: Option<f64>) -> 
 
     let fd = file.as_raw_fd();
     let res = device::send_key_frame(
-        &[(name, rgb)],
+        pairs,
         seconds,
         |frame| proto::hid_set_feature(fd, frame),
         responsive_sleep,
@@ -305,6 +356,11 @@ pub fn run_key_lighting(name: &str, rgb: (u8, u8, u8), seconds: Option<f64>) -> 
             1
         }
     }
+}
+
+/// Run per-key RGB lighting loop on the hardware interface 1 control node.
+pub fn run_key_lighting(name: &str, rgb: (u8, u8, u8), seconds: Option<f64>) -> i32 {
+    run_keys_lighting(&[(name, rgb)], seconds)
 }
 
 /// Print available effect names with descriptions.
@@ -475,6 +531,177 @@ pub fn run() -> i32 {
             run_effect_lighting(&effect, clamped_brightness, seconds)
         }
         Commands::Effects => cmd_effects(),
+        Commands::Profile { action } => cmd_profile(&action),
+    }
+}
+
+/// Handler for profile CLI subcommands.
+pub fn cmd_profile(action: &ProfileCommands) -> i32 {
+    match action {
+        ProfileCommands::Save {
+            name,
+            effect,
+            color,
+            brightness,
+            keys,
+        } => {
+            let parsed_color = match color {
+                Some(c) => match parse_color_hex(c) {
+                    Ok(rgb) => Some(rgb),
+                    Err(e) => {
+                        eprintln!("Error parsing --color: {}", e);
+                        return 1;
+                    }
+                },
+                None => None,
+            };
+
+            let mut parsed_keys = Vec::new();
+            for key_arg in keys {
+                let (k, hex) = match key_arg.split_once('=') {
+                    Some(pair) => pair,
+                    None => {
+                        eprintln!(
+                            "Error: Invalid --key format {:?}, expected NAME=COLOR (e.g. esc=FF0000)",
+                            key_arg
+                        );
+                        return 1;
+                    }
+                };
+                let rgb = match parse_color_hex(hex) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Error parsing color in --key {:?}: {}", key_arg, e);
+                        return 1;
+                    }
+                };
+                parsed_keys.push((k.trim().to_string(), rgb));
+            }
+
+            let prof = profile::Profile::new(
+                name.clone(),
+                effect.clone(),
+                parsed_color,
+                *brightness,
+                parsed_keys,
+            );
+
+            match profile::save_profile(&prof, None) {
+                Ok(path) => {
+                    println!("Saved profile '{}' to {}", prof.name, path.display());
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Error saving profile: {}", e);
+                    1
+                }
+            }
+        }
+        ProfileCommands::Load { name, seconds } => {
+            let prof = match profile::load_profile(name, None) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Error loading profile: {}", e);
+                    return 1;
+                }
+            };
+
+            let runner_res = prof.apply_with_runner(*seconds, |params| match params {
+                profile::AppliedProfileParams::Effect {
+                    effect,
+                    brightness,
+                    seconds,
+                } => {
+                    println!(
+                        "Applying profile '{}' (effect: {:?}, brightness: {:.2})...",
+                        prof.name, effect, brightness
+                    );
+                    let exit = run_effect_lighting(effect, *brightness, *seconds);
+                    if exit == 0 {
+                        Ok(())
+                    } else {
+                        Err(format!("Device communication exited with code {}", exit))
+                    }
+                }
+                profile::AppliedProfileParams::Keys { pairs, seconds } => {
+                    println!(
+                        "Applying profile '{}' ({} per-key overrides)...",
+                        prof.name,
+                        pairs.len()
+                    );
+                    let borrowed: Vec<(&str, (u8, u8, u8))> =
+                        pairs.iter().map(|(k, c)| (k.as_str(), *c)).collect();
+                    let exit = run_keys_lighting(&borrowed, *seconds);
+                    if exit == 0 {
+                        Ok(())
+                    } else {
+                        Err(format!("Device communication exited with code {}", exit))
+                    }
+                }
+            });
+
+            match runner_res {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("Error applying profile: {}", e);
+                    1
+                }
+            }
+        }
+        ProfileCommands::List => {
+            match profile::list_profiles(None) {
+                Ok(list) => {
+                    if list.is_empty() {
+                        println!("No profiles found.");
+                    } else {
+                        println!("Saved profiles ({}):", list.len());
+                        for name in list {
+                            println!("  {}", name);
+                        }
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Error listing profiles: {}", e);
+                    1
+                }
+            }
+        }
+        ProfileCommands::Delete { name } => {
+            match profile::delete_profile(name, None) {
+                Ok(()) => {
+                    println!("Profile '{}' deleted.", name);
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Error deleting profile: {}", e);
+                    1
+                }
+            }
+        }
+        ProfileCommands::Show { name } => {
+            match profile::load_profile(name, None) {
+                Ok(prof) => {
+                    println!("Profile: {}", prof.name);
+                    println!("  Effect: {}", prof.effect);
+                    if let Some(c) = prof.color {
+                        println!("  Color: #{:02X}{:02X}{:02X}", c.0, c.1, c.2);
+                    }
+                    println!("  Brightness: {:.2}", prof.brightness);
+                    if !prof.keys.is_empty() {
+                        println!("  Key Overrides ({}):", prof.keys.len());
+                        for (k, c) in &prof.keys {
+                            println!("    {:<12} = #{:02X}{:02X}{:02X}", k, c.0, c.1, c.2);
+                        }
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Error showing profile: {}", e);
+                    1
+                }
+            }
+        }
     }
 }
 
@@ -592,6 +819,101 @@ mod tests {
         assert!(parsed.is_ok());
         assert!(matches!(parsed.unwrap().command, Commands::Effects));
         assert_eq!(cmd_effects(), 0);
+    }
+
+    #[test]
+    fn test_cli_subcommand_profile_parse() {
+        // Save with effect, color, brightness, keys
+        let parsed_save = Cli::try_parse_from([
+            "aula-f75-rs",
+            "profile",
+            "save",
+            "gaming",
+            "--effect",
+            "rainbow",
+            "--color",
+            "FF0000",
+            "--brightness",
+            "0.75",
+            "--key",
+            "esc=00FF00",
+            "--key",
+            "space=0000FF",
+        ]);
+        assert!(parsed_save.is_ok());
+        match parsed_save.unwrap().command {
+            Commands::Profile {
+                action:
+                    ProfileCommands::Save {
+                        name,
+                        effect,
+                        color,
+                        brightness,
+                        keys,
+                    },
+            } => {
+                assert_eq!(name, "gaming");
+                assert_eq!(effect, "rainbow");
+                assert_eq!(color, Some("FF0000".to_string()));
+                assert_eq!(brightness, 0.75);
+                assert_eq!(keys, vec!["esc=00FF00", "space=0000FF"]);
+            }
+            _ => panic!("Expected Commands::Profile::Save"),
+        }
+
+        // Load
+        let parsed_load = Cli::try_parse_from([
+            "aula-f75-rs",
+            "profile",
+            "load",
+            "gaming",
+            "--seconds",
+            "5.0",
+        ]);
+        assert!(parsed_load.is_ok());
+        match parsed_load.unwrap().command {
+            Commands::Profile {
+                action: ProfileCommands::Load { name, seconds },
+            } => {
+                assert_eq!(name, "gaming");
+                assert_eq!(seconds, Some(5.0));
+            }
+            _ => panic!("Expected Commands::Profile::Load"),
+        }
+
+        // List
+        let parsed_list = Cli::try_parse_from(["aula-f75-rs", "profile", "list"]);
+        assert!(parsed_list.is_ok());
+        assert!(matches!(
+            parsed_list.unwrap().command,
+            Commands::Profile {
+                action: ProfileCommands::List
+            }
+        ));
+
+        // Delete
+        let parsed_delete = Cli::try_parse_from(["aula-f75-rs", "profile", "delete", "gaming"]);
+        assert!(parsed_delete.is_ok());
+        match parsed_delete.unwrap().command {
+            Commands::Profile {
+                action: ProfileCommands::Delete { name },
+            } => {
+                assert_eq!(name, "gaming");
+            }
+            _ => panic!("Expected Commands::Profile::Delete"),
+        }
+
+        // Show
+        let parsed_show = Cli::try_parse_from(["aula-f75-rs", "profile", "show", "gaming"]);
+        assert!(parsed_show.is_ok());
+        match parsed_show.unwrap().command {
+            Commands::Profile {
+                action: ProfileCommands::Show { name },
+            } => {
+                assert_eq!(name, "gaming");
+            }
+            _ => panic!("Expected Commands::Profile::Show"),
+        }
     }
 }
 

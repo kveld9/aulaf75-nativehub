@@ -12,6 +12,7 @@ The AULA F75 keyboard exposes USB HID interfaces (typical VID `258a`, PID `010c`
 - **Tranche 4**: Native Rust GUI (`aula-f75-gui`) using `egui` and `eframe` with a non-blocking streaming worker thread.
 - **Tranche 5**: Per-key LED map for the AULA F75 (80 mapped key slots) and `key`/`keys` CLI subcommands.
 - **Tranche 6**: Host-rendered RGB lighting effects engine (`rainbow`, `wave`, `breathe`, `stars`, `solid`, `off`) and presentable desktop GUI panel.
+- **Tranche 7**: Local lighting profiles (`save`, `load`, `list`, `delete`, `show`) for effects, colors, brightness, and per-key overrides with XDG flat file persistence and desktop GUI integration.
 
 ## Non-Goals & Safety Rules
 
@@ -147,6 +148,27 @@ cargo build --release
 
 # Stream Wave effect for 10 seconds
 ./target/release/aula-f75-rs fx wave --seconds 10
+
+# Save a local profile with an effect and brightness
+./target/release/aula-f75-rs profile save rainbow-chill --effect rainbow --brightness 0.8
+
+# Save a solid color profile
+./target/release/aula-f75-rs profile save cyan-work --effect solid --color 00FFFF --brightness 0.5
+
+# Save a per-key gaming profile (WASD in red, space in green)
+./target/release/aula-f75-rs profile save fps-wasd --effect off --key w=FF0000 --key a=FF0000 --key s=FF0000 --key d=FF0000 --key space=00FF00
+
+# List saved profiles
+./target/release/aula-f75-rs profile list
+
+# Show profile configuration details
+./target/release/aula-f75-rs profile show fps-wasd
+
+# Load and apply a profile (effect or per-key overrides)
+./target/release/aula-f75-rs profile load rainbow-chill
+
+# Delete a profile
+./target/release/aula-f75-rs profile delete cyan-work
 ```
 
 > [!NOTE]
@@ -183,12 +205,67 @@ Alternatively, run the compiled release binary:
 - **Side Panel Hardware Status**: Left side panel displays live device connection status (indicator dot, device model, VID/PID `258a:010c`, interface 1 node path, and error diagnostics).
 - **Effect Selection**: Dropdown selector supporting `Solid`, `Rainbow`, `Wave`, `Breathe`, `Stars`, and `Off`.
 - **Dynamic Parameters**: Color picker and hex input field enabled for color-dependent modes (`Solid`, `Breathe`); global brightness slider (`0%..=100%`) applied smoothly across all effects.
+- **Lighting Profiles Panel**: Integrated profiles management interface with profile dropdown selector, instant **Apply** button, **Delete** button, and **Save Profile** input capturing the active effect, color, and brightness into a local flat file preset without cloud or vendor dependencies.
 - **Non-Blocking Streaming Worker**: Direct Report 6 frames are streamed at ~25 Hz (`Duration::from_millis(40)`) for fluid animations and ~1.5 Hz (`KEEPALIVE_HZ`) for solid keepalive on a dedicated background thread with transient error retry (`EPIPE`, `ETIMEDOUT`). The UI rendering thread is never blocked.
 - **Start / Stop Controls**: Dedicated "Start Streaming" and "Stop / Off" buttons with live footer reporting active stream name, estimated tick rate, and hardware communication status.
 - **Clean Lifecycle**: Window close signals worker termination, joins the thread, and cleanly drops the device descriptor.
 
 > [!NOTE]
 > **CUSTOM Mode Requirement**: The physical keyboard must be toggled into its onboard "Custom" / user static RGB mode (via onboard Fn shortcuts) for software-driven colors to display.
+
+## Local Lighting Profiles (Tranche 7)
+
+Tranche 7 introduces fully offline, local lighting profiles for saving, loading, listing, and applying lighting configurations across both CLI and GUI.
+
+### Storage Location & Environment Overrides
+
+Profiles are stored as human-readable, flat `.toml` key-value files in the standard XDG user configuration path:
+
+- Default location: `$XDG_CONFIG_HOME/aula-f75/profiles/<name>.toml`
+- Fallback: `~/.config/aula-f75/profiles/<name>.toml`
+- Environment override: `AULA_F75_CONFIG=/custom/dir` points directly to the base config directory (creating a `profiles/` subdirectory as needed).
+
+### File Schema
+
+Each profile is stored as a flat `key = value` text file parsed strictly with file-and-line error diagnostics:
+
+```toml
+# AULA F75 Lighting Profile
+name = fps-wasd
+effect = off
+brightness = 0.80
+key.w = FF0000
+key.a = FF0000
+key.s = FF0000
+key.d = FF0000
+key.space = 00FF00
+```
+
+Supported keys:
+- `name`: Profile identifier string.
+- `effect`: Host effect name (`solid`, `rainbow`, `wave`, `breathe`, `stars`, `off`, `custom`).
+- `color`: 6-digit hex color triplet (`RRGGBB`) required for `solid` and `breathe`.
+- `brightness`: Floating point multiplier clamped to `0.0`..=`1.0`.
+- `key.<name>`: Per-key RGB color override where `<name>` is any valid key or alias recognized by the keymap (e.g. `key.esc = FF0000`).
+
+### CLI Commands
+
+```bash
+# Save profile
+aula-f75-rs profile save NAME --effect E [--color RRGGBB] [--brightness B] [--key NAME=COLOR ...]
+
+# Load and apply profile
+aula-f75-rs profile load NAME [--seconds N]
+
+# List profiles
+aula-f75-rs profile list
+
+# Show profile details
+aula-f75-rs profile show NAME
+
+# Delete profile
+aula-f75-rs profile delete NAME
+```
 
 ### Verification Gate
 
