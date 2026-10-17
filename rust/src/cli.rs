@@ -116,6 +116,18 @@ pub enum Commands {
         #[arg(long, default_value_t = 2.0)]
         seconds: f64,
     },
+    /// Set RGB color on a single named key
+    Key {
+        /// Key name or alias (e.g. 'esc', 'space', 'enter', 'f1')
+        name: String,
+        /// Hex color string (e.g. 'ff0000', '#00ff00')
+        color: String,
+        /// Duration to maintain color in seconds (0 = hold until Ctrl+C)
+        #[arg(long)]
+        seconds: Option<f64>,
+    },
+    /// List all known key names and their slot numbers
+    Keys,
 }
 
 /// List detected HID devices and flag known AULA hardware.
@@ -232,6 +244,53 @@ pub fn run_lighting(rgb: (u8, u8, u8), seconds: Option<f64>) -> i32 {
     }
 }
 
+/// List all known key names and their slot numbers.
+pub fn cmd_keys() -> i32 {
+    println!("AULA F75 Key Map ({} keys):", proto::KEY_SLOTS.len());
+    for &(name, slot) in proto::KEY_SLOTS {
+        println!("  {:<12} (slot {:>2})", name, slot);
+    }
+    0
+}
+
+/// Run per-key RGB lighting loop on the hardware interface 1 control node.
+pub fn run_key_lighting(name: &str, rgb: (u8, u8, u8), seconds: Option<f64>) -> i32 {
+    let node = match device::resolve_control_node() {
+        Some(n) => n,
+        None => {
+            eprintln!("Error: AULA F75 interface 1 control node not found.");
+            return 1;
+        }
+    };
+
+    let file = match OpenOptions::new().read(true).write(true).open(&node) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error opening control node {}: {}", node.display(), e);
+            return 1;
+        }
+    };
+
+    install_sigint_handler();
+
+    let fd = file.as_raw_fd();
+    let res = device::send_key_frame(
+        &[(name, rgb)],
+        seconds,
+        |frame| proto::hid_set_feature(fd, frame),
+        responsive_sleep,
+        is_running,
+    );
+
+    match res {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("Device communication error: {}", e);
+            1
+        }
+    }
+}
+
 /// Execute CLI commands and return exit code.
 pub fn run() -> i32 {
     let cli = Cli::parse();
@@ -274,6 +333,28 @@ pub fn run() -> i32 {
             let sec = if seconds <= 0.0 { 2.0 } else { seconds };
             run_lighting((0, 0, 0), Some(sec))
         }
+        Commands::Key {
+            name,
+            color,
+            seconds,
+        } => {
+            if proto::slot_for_key(&name).is_none() {
+                eprintln!(
+                    "Error: Unknown key '{}'. Use 'aula-f75-rs keys' to see available keys.",
+                    name
+                );
+                return 2;
+            }
+            let rgb = match parse_color_hex(&color) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error parsing hex color: {}", e);
+                    return 2;
+                }
+            };
+            run_key_lighting(&name, rgb, seconds)
+        }
+        Commands::Keys => cmd_keys(),
     }
 }
 
@@ -308,4 +389,30 @@ mod tests {
         assert_eq!(parse_hex_or_dec("9610").unwrap(), 9610);
         assert!(parse_hex_or_dec("zzzz").is_err());
     }
+
+    #[test]
+    fn test_cmd_keys() {
+        assert_eq!(cmd_keys(), 0);
+    }
+
+    #[test]
+    fn test_cli_subcommand_key_parse() {
+        let parsed = Cli::try_parse_from(["aula-f75-rs", "key", "esc", "ff0000", "--seconds", "3"]);
+        assert!(parsed.is_ok());
+        if let Commands::Key { name, color, seconds } = parsed.unwrap().command {
+            assert_eq!(name, "esc");
+            assert_eq!(color, "ff0000");
+            assert_eq!(seconds, Some(3.0));
+        } else {
+            panic!("Expected Commands::Key");
+        }
+    }
+
+    #[test]
+    fn test_cli_subcommand_keys_parse() {
+        let parsed = Cli::try_parse_from(["aula-f75-rs", "keys"]);
+        assert!(parsed.is_ok());
+        assert!(matches!(parsed.unwrap().command, Commands::Keys));
+    }
 }
+

@@ -57,10 +57,30 @@ Confirmed live on `258a:010c` hardware (2026-10-17):
 - **Latching & Keepalive Behavior**: Colors latch immediately upon receiving the frame. No initialization handshake or apply command is needed. However, the MCU firmware reverts to its onboard lighting effect after a few idle seconds (~3-5 s). The host utility must resend the frame at ~1-2 Hz (`KEEPALIVE_HZ`) to maintain solid colors.
 - **Onboard Mode Requirement**: The keyboard must be in its onboard custom/static RGB profile to display host software-driven frames.
 
+### 3.1 Per-Key LED Slot Layout
+
+Individual key LEDs map directly to slot indices `0..169` within the 520-byte Report 6 frame. Each slot occupies 3 contiguous bytes `[R, G, B]` starting at byte offset `8 + 3 * slot`. Unlit keys or unmapped slots remain zeroed (`00 00 00`).
+
+The AULA F75 75% physical matrix provides 80 mapped LED slots (max slot index 89 < 170). Unmapped slots include physical matrix gaps and components without discrete LEDs (e.g. rotary knob):
+
+| Row | Keys and Frame Slot Numbers (`slot = index`) |
+| :--- | :--- |
+| **Row 0** | `esc=0`, `f1=12`, `f2=18`, `f3=24`, `f4=30`, `f5=36`, `f6=42`, `f7=48`, `f8=54`, `f9=60`, `f10=66`, `f11=72`, `f12=78`, `del=85`, `pgup=86`, `pgdn=87` |
+| **Row 1** | `backtick=1`, `1=7`, `2=13`, `3=19`, `4=25`, `5=31`, `6=37`, `7=43`, `8=49`, `9=55`, `0=61`, `minus=67`, `equal=73`, `backspace=79` |
+| **Row 2** | `tab=2`, `q=8`, `w=14`, `e=20`, `r=26`, `t=32`, `y=38`, `u=44`, `i=50`, `o=56`, `p=62`, `lbracket=68`, `rbracket=74`, `backslash=80` |
+| **Row 3** | `capslock=3`, `a=9`, `s=15`, `d=21`, `f=27`, `g=33`, `h=39`, `j=45`, `k=51`, `l=57`, `semicolon=63`, `quote=69`, `enter=81` |
+| **Row 4** | `lshift=4`, `z=10`, `x=16`, `c=22`, `v=28`, `b=34`, `n=40`, `m=46`, `comma=52`, `dot=58`, `slash=64`, `rshift=70`, `up=82`, `end=88` |
+| **Row 5** | `lctrl=5`, `lwin=11`, `lalt=17`, `space=35`, `rfn=53`, `rctrl=59`, `left=77`, `down=83`, `right=89` |
+
+#### Key LED Protocol Behavior
+- **Frame Assembly**: Per-key frames preserve the exact 8-byte header (`06 08 00 00 01 00 7A 01`), populate requested `(R, G, B)` triplets at `8 + 3 * slot`, leave non-targeted slots as `00 00 00`, and zero-pad the final 2 bytes (518..519).
+- **Keepalive Invariant**: Per-key lighting follows the same keepalive requirement as full-board solid colors: frames must be resent at ~1.5 Hz (`KEEPALIVE_HZ`) to prevent the keyboard from reverting to onboard lighting patterns.
+- **Credit & Status**: Key-to-slot mapping cross-checked against OpenRGB Sinowealth 010C driver (`aula_f75_layout`); hardware-free test suite verified; live hardware verification pending.
 
 ---
 
 ## 4. Credits
 
-Protocol facts cross-checked with OpenRGB Sinowealth 010C driver, gamen-rgb, and kreo-hive65-rgb-linux; implementation here is original.
+Protocol facts cross-checked with OpenRGB Sinowealth 010C driver (`aula_f75_layout`), gamen-rgb, and kreo-hive65-rgb-linux; implementation here is original.
+
 

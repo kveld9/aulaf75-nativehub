@@ -425,6 +425,84 @@ where
     Ok(())
 }
 
+/// Send a direct RGB frame or run keepalive loop for solid whole-board color.
+pub fn send_frame<F, S, R>(
+    rgb: (u8, u8, u8),
+    seconds: Option<f64>,
+    send_fn: F,
+    sleep_fn: S,
+    is_running_fn: R,
+) -> Result<(), io::Error>
+where
+    F: FnMut(&[u8; crate::proto::FRAME_LEN]) -> Result<(), io::Error>,
+    S: FnMut(Duration),
+    R: FnMut() -> bool,
+{
+    run_keepalive_loop(rgb, seconds, send_fn, sleep_fn, is_running_fn)
+}
+
+/// Send a key frame or run keepalive loop for specified key color pairs.
+///
+/// Builds a per-key direct RGB frame lighting only the named keys, and maintains
+/// keepalive transmission at `KEEPALIVE_HZ` (~1.5 Hz) with transient error retry.
+pub fn send_key_frame<F, S, R>(
+    pairs: &[(&str, (u8, u8, u8))],
+    seconds: Option<f64>,
+    mut send_fn: F,
+    mut sleep_fn: S,
+    mut is_running_fn: R,
+) -> Result<(), io::Error>
+where
+    F: FnMut(&[u8; crate::proto::FRAME_LEN]) -> Result<(), io::Error>,
+    S: FnMut(Duration),
+    R: FnMut() -> bool,
+{
+    let frame = crate::proto::build_key_frame(pairs)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let interval = Duration::from_secs_f64(1.0 / crate::proto::KEEPALIVE_HZ);
+    let start_time = Instant::now();
+    let mut count: u64 = 0;
+    let mut consecutive_failures = 0;
+
+    while is_running_fn() {
+        match send_fn(&frame) {
+            Ok(()) => {
+                consecutive_failures = 0;
+            }
+            Err(e) => {
+                let code = e.raw_os_error();
+                if code == Some(libc::EPIPE) || code == Some(libc::ETIMEDOUT) {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= 10 {
+                        return Err(e);
+                    }
+                    sleep_fn(interval);
+                    continue;
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+
+        count += 1;
+        if let Some(sec) = seconds {
+            if sec > 0.0 && start_time.elapsed().as_secs_f64() >= sec && count >= 2 {
+                break;
+            }
+        }
+
+        sleep_fn(interval);
+
+        if let Some(sec) = seconds {
+            if sec > 0.0 && start_time.elapsed().as_secs_f64() >= sec && count >= 2 {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,4 +582,40 @@ mod tests {
         assert!(res.is_ok());
         assert!(sent_frames >= 2);
     }
+
+    #[test]
+    fn test_send_key_frame_timed_exit() {
+        let mut sent_frames = 0;
+        let mut last_key_val = 0;
+        let res = send_key_frame(
+            &[("esc", (0x42, 0x00, 0x00))],
+            Some(0.001),
+            |frame| {
+                sent_frames += 1;
+                last_key_val = frame[8];
+                Ok(())
+            },
+            |_| {},
+            || true,
+        );
+
+        assert!(res.is_ok());
+        assert!(sent_frames >= 2);
+        assert_eq!(last_key_val, 0x42);
+    }
+
+    #[test]
+    fn test_send_key_frame_unknown_key_error() {
+        let res = send_key_frame(
+            &[("invalid_key_alias", (0xFF, 0x00, 0x00))],
+            Some(1.0),
+            |_| Ok(()),
+            |_| {},
+            || true,
+        );
+
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
 }
+

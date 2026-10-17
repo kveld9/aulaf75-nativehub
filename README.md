@@ -10,6 +10,7 @@ The AULA F75 keyboard exposes USB HID interfaces (typical VID `258a`, PID `010c`
 - **Tranche 2**: Verified direct RGB lighting write paths (`solid`, `off`) using Linux stdlib `hidraw` ioctls on interface 1.
 - **Tranche 3**: Standalone Rust CLI binary (`aula-f75-rs`) with zero external native dependencies beyond `libc`.
 - **Tranche 4**: Native Rust GUI (`aula-f75-gui`) using `egui` and `eframe` with a non-blocking streaming worker thread.
+- **Tranche 5**: Per-key LED map for the AULA F75 (80 mapped key slots) and `key`/`keys` CLI subcommands.
 
 ## Non-Goals & Safety Rules
 
@@ -121,7 +122,23 @@ cargo build --release
 
 # Inspect device metadata
 ./target/release/aula-f75-rs info
+
+# List all supported key names and slot numbers
+./target/release/aula-f75-rs keys
+
+# Set RGB color for a specific named key (e.g. Esc in red)
+./target/release/aula-f75-rs key esc FF0000
+
+# Light space key in green using alias for 5 seconds
+./target/release/aula-f75-rs key spacebar "#00FF00" --seconds 5
 ```
+
+> [!NOTE]
+> **Key Aliases & Case-Insensitivity**: Key names are case-insensitive and support common aliases (e.g. `esc`/`escape`, `space`/`spacebar`, `-`/`minus`, `[`/`lbracket`, `]`/`rbracket`, `\` / `backslash`, `;`/`semicolon`, `'`/`quote`, `,`/`comma`, `.`/`dot`, `/`/`slash`, `` ` ``/`backtick`, `up`/`uparrow`, `down`/`downarrow`, `left`/`leftarrow`, `right`/`rightarrow`, `del`/`delete`, `pgup`/`pageup`, `pgdn`/`pagedown`, `enter`/`return`).
+
+> [!NOTE]
+> **Keymap Layout Source**: Slot mappings (80 mapped physical keys) are derived from OpenRGB Sinowealth 010C `aula_f75_layout` cross-checked facts (live hardware verification pending).
+
 
 ## Rust GUI (`aula-f75-gui`)
 
