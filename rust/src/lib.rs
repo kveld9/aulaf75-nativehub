@@ -2,5 +2,6 @@
 
 pub mod cli;
 pub mod device;
+pub mod effects;
 pub mod gui;
 pub mod proto;

@@ -128,6 +128,22 @@ pub enum Commands {
     },
     /// List all known key names and their slot numbers
     Keys,
+    /// Stream a host-rendered RGB lighting effect
+    Fx {
+        /// Effect name (solid, rainbow, wave, breathe, stars, off)
+        name: String,
+        /// Hex color string (e.g. 'ff0000', '#00ff00') for effects requiring color (solid, breathe)
+        #[arg(long)]
+        color: Option<String>,
+        /// Brightness multiplier (0.0 to 1.0)
+        #[arg(long, default_value_t = 1.0)]
+        brightness: f32,
+        /// Duration to run effect in seconds (0 or omitted = run until Ctrl+C)
+        #[arg(long)]
+        seconds: Option<f64>,
+    },
+    /// List available host-rendered RGB lighting effects
+    Effects,
 }
 
 /// List detected HID devices and flag known AULA hardware.
@@ -291,6 +307,67 @@ pub fn run_key_lighting(name: &str, rgb: (u8, u8, u8), seconds: Option<f64>) -> 
     }
 }
 
+/// Print available effect names with descriptions.
+pub fn cmd_effects() -> i32 {
+    println!("Available RGB effects:");
+    println!("  solid:   Static single color across all keys (requires --color)");
+    println!("  rainbow: Smooth cyclic whole-board spectrum shift");
+    println!("  wave:    Horizontal chromatic wave propagating across keys");
+    println!("  breathe: Pulsing illumination fading between black and color (requires --color)");
+    println!("  stars:   Deterministic twinkling starry night across keys");
+    println!("  off:     Turn off RGB lighting");
+    0
+}
+
+/// Run host-rendered RGB effect streaming loop on the hardware interface 1 control node.
+pub fn run_effect_lighting(
+    effect: &crate::effects::Effect,
+    brightness: f32,
+    seconds: Option<f64>,
+) -> i32 {
+    let node = match device::resolve_control_node() {
+        Some(n) => n,
+        None => {
+            eprintln!("Error: AULA F75 interface 1 control node not found.");
+            return 1;
+        }
+    };
+
+    let file = match OpenOptions::new().read(true).write(true).open(&node) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error opening control node {}: {}", node.display(), e);
+            return 1;
+        }
+    };
+
+    install_sigint_handler();
+
+    let fd = file.as_raw_fd();
+    let tick_hz = match effect {
+        crate::effects::Effect::Solid(_) => proto::KEEPALIVE_HZ,
+        _ => 25.0,
+    };
+
+    let res = device::run_effect(
+        effect,
+        brightness,
+        seconds,
+        tick_hz,
+        |frame| proto::hid_set_feature(fd, frame),
+        responsive_sleep,
+        is_running,
+    );
+
+    match res {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("Device communication error: {}", e);
+            1
+        }
+    }
+}
+
 /// Execute CLI commands and return exit code.
 pub fn run() -> i32 {
     let cli = Cli::parse();
@@ -355,6 +432,49 @@ pub fn run() -> i32 {
             run_key_lighting(&name, rgb, seconds)
         }
         Commands::Keys => cmd_keys(),
+        Commands::Fx {
+            name,
+            color,
+            brightness,
+            seconds,
+        } => {
+            let lower_name = name.trim().to_ascii_lowercase();
+            if (lower_name == "solid" || lower_name == "breathe") && color.is_none() {
+                eprintln!("Error: Effect '{}' requires --color RRGGBB", name);
+                return 2;
+            }
+            if (lower_name == "rainbow"
+                || lower_name == "wave"
+                || lower_name == "stars"
+                || lower_name == "off")
+                && color.is_some()
+            {
+                eprintln!("Warning: --color is ignored for effect '{}'", name);
+            }
+
+            let parsed_color = match color.as_deref() {
+                Some(c) => match parse_color_hex(c) {
+                    Ok((r, g, b)) => Some(crate::effects::RGB(r, g, b)),
+                    Err(e) => {
+                        eprintln!("Error parsing hex color: {}", e);
+                        return 2;
+                    }
+                },
+                None => None,
+            };
+
+            let effect = match crate::effects::Effect::from_name(&name, parsed_color) {
+                Ok(eff) => eff,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    return 2;
+                }
+            };
+
+            let clamped_brightness = brightness.clamp(0.0, 1.0);
+            run_effect_lighting(&effect, clamped_brightness, seconds)
+        }
+        Commands::Effects => cmd_effects(),
     }
 }
 
@@ -413,6 +533,65 @@ mod tests {
         let parsed = Cli::try_parse_from(["aula-f75-rs", "keys"]);
         assert!(parsed.is_ok());
         assert!(matches!(parsed.unwrap().command, Commands::Keys));
+    }
+
+    #[test]
+    fn test_cli_subcommand_fx_parse() {
+        let parsed = Cli::try_parse_from([
+            "aula-f75-rs",
+            "fx",
+            "rainbow",
+            "--brightness",
+            "0.8",
+            "--seconds",
+            "10",
+        ]);
+        assert!(parsed.is_ok());
+        if let Commands::Fx {
+            name,
+            color,
+            brightness,
+            seconds,
+        } = parsed.unwrap().command
+        {
+            assert_eq!(name, "rainbow");
+            assert_eq!(color, None);
+            assert_eq!(brightness, 0.8);
+            assert_eq!(seconds, Some(10.0));
+        } else {
+            panic!("Expected Commands::Fx");
+        }
+
+        let parsed_breathe = Cli::try_parse_from([
+            "aula-f75-rs",
+            "fx",
+            "breathe",
+            "--color",
+            "ff00ff",
+        ]);
+        assert!(parsed_breathe.is_ok());
+        if let Commands::Fx {
+            name,
+            color,
+            brightness,
+            seconds,
+        } = parsed_breathe.unwrap().command
+        {
+            assert_eq!(name, "breathe");
+            assert_eq!(color, Some("ff00ff".to_string()));
+            assert_eq!(brightness, 1.0);
+            assert_eq!(seconds, None);
+        } else {
+            panic!("Expected Commands::Fx");
+        }
+    }
+
+    #[test]
+    fn test_cli_subcommand_effects_parse() {
+        let parsed = Cli::try_parse_from(["aula-f75-rs", "effects"]);
+        assert!(parsed.is_ok());
+        assert!(matches!(parsed.unwrap().command, Commands::Effects));
+        assert_eq!(cmd_effects(), 0);
     }
 }
 

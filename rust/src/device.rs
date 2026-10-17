@@ -503,6 +503,90 @@ where
     Ok(())
 }
 
+/// Run host-rendered RGB effect streaming loop until `seconds` expires or `is_running_fn` returns false.
+pub fn run_effect<F, S, R>(
+    effect: &crate::effects::Effect,
+    brightness: f32,
+    seconds: Option<f64>,
+    tick_hz: f64,
+    mut send_fn: F,
+    mut sleep_fn: S,
+    mut is_running_fn: R,
+) -> Result<(), io::Error>
+where
+    F: FnMut(&[u8; crate::proto::FRAME_LEN]) -> Result<(), io::Error>,
+    S: FnMut(Duration),
+    R: FnMut() -> bool,
+{
+    let key_slots = crate::proto::all_key_slots();
+    let interval = Duration::from_secs_f64(1.0 / tick_hz.max(1.0));
+    let start_time = Instant::now();
+    let mut count: u64 = 0;
+    let mut consecutive_failures = 0;
+
+    while is_running_fn() {
+        let t = start_time.elapsed().as_secs_f64();
+        let pairs = crate::effects::render(effect, t, &key_slots);
+        let scaled = crate::effects::apply_brightness(&pairs, brightness);
+        let frame = crate::proto::build_slot_frame(&scaled)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+        match send_fn(&frame) {
+            Ok(()) => {
+                consecutive_failures = 0;
+            }
+            Err(e) => {
+                let code = e.raw_os_error();
+                if code == Some(libc::EPIPE) || code == Some(libc::ETIMEDOUT) {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= 10 {
+                        return Err(e);
+                    }
+                    sleep_fn(interval);
+                    continue;
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+
+        count += 1;
+        if let Some(sec) = seconds {
+            if sec > 0.0 && start_time.elapsed().as_secs_f64() >= sec && count >= 2 {
+                break;
+            }
+        }
+
+        sleep_fn(interval);
+
+        if let Some(sec) = seconds {
+            if sec > 0.0 && start_time.elapsed().as_secs_f64() >= sec && count >= 2 {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Send a host-rendered effect frame or run keepalive streaming loop.
+pub fn send_effect_frame<F, S, R>(
+    effect: &crate::effects::Effect,
+    brightness: f32,
+    seconds: Option<f64>,
+    tick_hz: f64,
+    send_fn: F,
+    sleep_fn: S,
+    is_running_fn: R,
+) -> Result<(), io::Error>
+where
+    F: FnMut(&[u8; crate::proto::FRAME_LEN]) -> Result<(), io::Error>,
+    S: FnMut(Duration),
+    R: FnMut() -> bool,
+{
+    run_effect(effect, brightness, seconds, tick_hz, send_fn, sleep_fn, is_running_fn)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,6 +700,28 @@ mod tests {
 
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_run_effect_timed_exit() {
+        let effect = crate::effects::Effect::Rainbow { period_s: 5.0 };
+        let mut sent_frames = 0;
+        let res = run_effect(
+            &effect,
+            0.8,
+            Some(0.001),
+            25.0,
+            |frame| {
+                sent_frames += 1;
+                assert_eq!(&frame[0..8], &crate::proto::HEADER);
+                Ok(())
+            },
+            |_| {},
+            || true,
+        );
+
+        assert!(res.is_ok());
+        assert!(sent_frames >= 2);
     }
 }
 

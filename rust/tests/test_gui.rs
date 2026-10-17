@@ -5,10 +5,11 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use aula_f75::effects::Effect;
 use aula_f75::gui::{
     parse_color_hex, run_worker_stream, GuiLightingMode, GuiState, WorkerMessage, WorkerStatus,
 };
-use aula_f75::proto::{FRAME_LEN, HEADER};
+use aula_f75::proto::HEADER;
 
 #[test]
 fn test_hex_parsing_shared_with_gui() {
@@ -39,7 +40,19 @@ fn test_app_state_transitions_solid_to_off() {
     assert_eq!(state.rgb, (100, 150, 200));
     assert_eq!(cmd, WorkerMessage::SetColor((100, 150, 200)));
 
-    // Transition from Solid to Off
+    // Transition from Solid to Effect
+    let rainbow = Effect::Rainbow { period_s: 5.0 };
+    let cmd = state.transition_to_effect(rainbow.clone(), 0.75);
+    assert_eq!(state.mode, GuiLightingMode::Effect(rainbow.clone()));
+    assert_eq!(
+        cmd,
+        WorkerMessage::SetEffect {
+            effect: rainbow,
+            brightness: 0.75
+        }
+    );
+
+    // Transition from Effect to Off
     let cmd = state.transition_to_off();
     assert_eq!(state.mode, GuiLightingMode::Off);
     assert_eq!(cmd, WorkerMessage::Off);
@@ -62,6 +75,22 @@ fn test_channel_message_shapes() {
             assert_eq!(rgb, (0xAA, 0xBB, 0xCC));
         }
         _ => panic!("Expected WorkerMessage::SetColor"),
+    }
+
+    // Verify SetEffect message variant shape
+    let wave = Effect::Wave { period_s: 3.0 };
+    tx.send(WorkerMessage::SetEffect {
+        effect: wave.clone(),
+        brightness: 0.9,
+    })
+    .unwrap();
+    let received = rx.recv().unwrap();
+    match received {
+        WorkerMessage::SetEffect { effect, brightness } => {
+            assert_eq!(effect, wave);
+            assert_eq!(brightness, 0.9);
+        }
+        _ => panic!("Expected WorkerMessage::SetEffect"),
     }
 
     // Verify Off message variant shape
@@ -202,4 +231,40 @@ fn test_worker_stream_transient_retry_and_fatal_error() {
 
     assert!(!errors.is_empty());
     assert!(errors[0].contains("after 10 retries"));
+}
+
+#[test]
+fn test_worker_stream_effect_streaming() {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (status_tx, status_rx) = mpsc::channel();
+
+    let mut sent_frames = Vec::new();
+
+    let handle = std::thread::spawn(move || {
+        run_worker_stream(
+            cmd_rx,
+            status_tx,
+            WorkerMessage::SetEffect {
+                effect: Effect::Rainbow { period_s: 5.0 },
+                brightness: 0.8,
+            },
+            Duration::from_millis(30),
+            |frame| {
+                sent_frames.push(*frame);
+                Ok(())
+            },
+            |_| {},
+        );
+        sent_frames
+    });
+
+    std::thread::sleep(Duration::from_millis(50));
+    cmd_tx.send(WorkerMessage::Stop).unwrap();
+
+    let recorded = handle.join().expect("Worker thread panicked");
+    assert!(!recorded.is_empty());
+    assert_eq!(&recorded[0][0..8], &HEADER);
+
+    let status = status_rx.recv().unwrap();
+    assert_eq!(status, WorkerStatus::Stopped);
 }

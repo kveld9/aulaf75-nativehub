@@ -199,6 +199,33 @@ pub fn build_key_frame(pairs: &[(&str, (u8, u8, u8))]) -> Result<[u8; FRAME_LEN]
     Ok(buf)
 }
 
+/// Build a 520-byte direct RGB frame lighting specific key slot indices.
+///
+/// Starts from a zeroed frame with the standard Report 6 header, sets RGB
+/// channels at `8 + 3 * slot`, and verifies that all slot offsets are within frame bounds.
+pub fn build_slot_frame(pairs: &[(u8, (u8, u8, u8))]) -> Result<[u8; FRAME_LEN], String> {
+    let mut buf = [0u8; FRAME_LEN];
+    buf[0..8].copy_from_slice(&HEADER);
+
+    for &(slot, (r, g, b)) in pairs {
+        let offset = 8 + 3 * (slot as usize);
+        if offset + 2 < FRAME_LEN - 2 {
+            buf[offset] = r;
+            buf[offset + 1] = g;
+            buf[offset + 2] = b;
+        } else {
+            return Err(format!("Slot index {} out of frame bounds", slot));
+        }
+    }
+
+    Ok(buf)
+}
+
+/// Return slot numbers of all mapped physical keys in `KEY_SLOTS`.
+pub fn all_key_slots() -> Vec<u8> {
+    KEY_SLOTS.iter().map(|&(_, slot)| slot).collect()
+}
+
 /// Send a HID feature report using the Linux HIDIOCSFEATURE ioctl.
 ///
 /// # Safety Rules

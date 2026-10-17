@@ -1,8 +1,9 @@
 //! Native egui/eframe GUI for AULA F75 mechanical keyboard configuration.
 //!
 //! Provides a reactive, non-blocking desktop interface for direct RGB lighting
-//! control. All USB HID communication is executed on a dedicated worker thread
-//! via Linux `hidraw` ioctls, ensuring the UI rendering thread is never blocked.
+//! control and host-rendered lighting effects. All USB HID communication is executed
+//! on a dedicated worker thread via Linux `hidraw` ioctls, ensuring the UI rendering
+//! thread is never blocked.
 
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
@@ -15,13 +16,29 @@ use eframe::egui;
 
 pub use crate::cli::parse_color_hex;
 use crate::device;
+use crate::effects::{self, Effect, RGB};
 use crate::proto;
 
+/// Available lighting effect names for the GUI effect selector.
+pub const AVAILABLE_EFFECTS: &[&str] = &[
+    "Solid",
+    "Rainbow",
+    "Wave",
+    "Breathe",
+    "Stars",
+    "Off",
+];
+
 /// Channel commands dispatched from the GUI thread to the background worker.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WorkerMessage {
     /// Update active solid color to the given `(R, G, B)` tuple.
     SetColor((u8, u8, u8)),
+    /// Stream a host-rendered dynamic or static effect with brightness.
+    SetEffect {
+        effect: Effect,
+        brightness: f32,
+    },
     /// Transmit all-zero off frame and cleanly stop the keepalive loop.
     Off,
     /// Immediately terminate keepalive loop and close device descriptor.
@@ -40,16 +57,18 @@ pub enum WorkerStatus {
 }
 
 /// Lighting mode state in the GUI state machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum GuiLightingMode {
     /// Lighting is off or idle (no active keepalive frames).
     Off,
     /// Actively transmitting solid color keepalive frames.
     Solid,
+    /// Actively transmitting a host-rendered effect.
+    Effect(Effect),
 }
 
-/// State tracking for lighting mode and color transitions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// State tracking for lighting mode, color, and active effect transitions.
+#[derive(Debug, Clone, PartialEq)]
 pub struct GuiState {
     pub mode: GuiLightingMode,
     pub rgb: (u8, u8, u8),
@@ -76,6 +95,12 @@ impl GuiState {
         WorkerMessage::SetColor(rgb)
     }
 
+    /// Transition to Effect mode with the given effect and brightness.
+    pub fn transition_to_effect(&mut self, effect: Effect, brightness: f32) -> WorkerMessage {
+        self.mode = GuiLightingMode::Effect(effect.clone());
+        WorkerMessage::SetEffect { effect, brightness }
+    }
+
     /// Transition to Off mode.
     pub fn transition_to_off(&mut self) -> WorkerMessage {
         self.mode = GuiLightingMode::Off;
@@ -91,21 +116,22 @@ impl GuiState {
 
 /// Core worker streaming loop parameterized over injectable send and sleep functions.
 ///
-/// Implements keepalive transmission at `KEEPALIVE_HZ` (~1.5 Hz) and transient error
-/// retries (EPIPE, ETIMEDOUT) matching the CLI implementation.
+/// Implements keepalive transmission at `KEEPALIVE_HZ` (~1.5 Hz) for solid mode,
+/// ~25 Hz (40 ms) for dynamic effects, and transient error retries (EPIPE, ETIMEDOUT).
 pub fn run_worker_stream<F, S>(
     rx: Receiver<WorkerMessage>,
     status_tx: Sender<WorkerStatus>,
     initial_cmd: WorkerMessage,
     interval: Duration,
     mut send_fn: F,
-    mut sleep_fn: S,
+    mut _sleep_fn: S,
 ) where
     F: FnMut(&[u8; proto::FRAME_LEN]) -> Result<(), std::io::Error>,
     S: FnMut(Duration),
 {
-    let mut current_color = match initial_cmd {
-        WorkerMessage::SetColor(rgb) => rgb,
+    let (mut current_effect, mut current_brightness) = match initial_cmd {
+        WorkerMessage::SetColor(rgb) => (Effect::Solid(RGB(rgb.0, rgb.1, rgb.2)), 1.0f32),
+        WorkerMessage::SetEffect { effect, brightness } => (effect, brightness),
         WorkerMessage::Off => {
             if let Ok(off_frame) = proto::build_direct_frame((0, 0, 0)) {
                 let _ = send_fn(&off_frame);
@@ -120,13 +146,41 @@ pub fn run_worker_stream<F, S>(
     };
 
     let mut consecutive_failures = 0;
+    let key_slots = proto::all_key_slots();
+    let stream_start = std::time::Instant::now();
 
     'outer: loop {
-        let frame = match proto::build_direct_frame(current_color) {
-            Ok(f) => f,
-            Err(e) => {
-                let _ = status_tx.send(WorkerStatus::Error(format!("Frame build error: {}", e)));
-                break;
+        let t = stream_start.elapsed().as_secs_f64();
+        let frame = match &current_effect {
+            Effect::Solid(rgb) => {
+                let scaled_rgb = rgb.scale(current_brightness).to_tuple();
+                match proto::build_direct_frame(scaled_rgb) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = status_tx.send(WorkerStatus::Error(format!("Frame build error: {}", e)));
+                        break;
+                    }
+                }
+            }
+            Effect::Off => {
+                match proto::build_direct_frame((0, 0, 0)) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = status_tx.send(WorkerStatus::Error(format!("Frame build error: {}", e)));
+                        break;
+                    }
+                }
+            }
+            dynamic_effect => {
+                let pairs = effects::render(dynamic_effect, t, &key_slots);
+                let scaled = effects::apply_brightness(&pairs, current_brightness);
+                match proto::build_slot_frame(&scaled) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = status_tx.send(WorkerStatus::Error(format!("Frame build error: {}", e)));
+                        break;
+                    }
+                }
             }
         };
 
@@ -155,15 +209,23 @@ pub fn run_worker_stream<F, S>(
             }
         }
 
-        // Wait for next keepalive tick while polling for UI commands in short steps.
+        let tick_interval = match current_effect {
+            Effect::Solid(_) => interval,
+            _ => Duration::from_millis(40),
+        };
+
         let start = std::time::Instant::now();
-        while start.elapsed() < interval {
-            let remaining = interval.saturating_sub(start.elapsed());
-            let poll_step = remaining.min(Duration::from_millis(50));
+        while start.elapsed() < tick_interval {
+            let remaining = tick_interval.saturating_sub(start.elapsed());
+            let poll_step = remaining.min(Duration::from_millis(10));
             match rx.recv_timeout(poll_step) {
                 Ok(WorkerMessage::SetColor(new_color)) => {
-                    current_color = new_color;
-                    // Break inner wait loop immediately to dispatch the new color
+                    current_effect = Effect::Solid(RGB(new_color.0, new_color.1, new_color.2));
+                    break;
+                }
+                Ok(WorkerMessage::SetEffect { effect, brightness }) => {
+                    current_effect = effect;
+                    current_brightness = brightness;
                     break;
                 }
                 Ok(WorkerMessage::Off) => {
@@ -175,11 +237,8 @@ pub fn run_worker_stream<F, S>(
                 Ok(WorkerMessage::Stop) => {
                     break 'outer;
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    // Continue sleep interval
-                }
+                Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
-                    // UI sender dropped (window closed or app exited)
                     break 'outer;
                 }
             }
@@ -233,7 +292,6 @@ fn run_worker_thread(
         thread::sleep,
     );
 
-    // Dropping file closes the underlying file descriptor
     drop(file);
 }
 
@@ -247,6 +305,10 @@ pub struct AulaF75App {
     pub hex_input: String,
     /// Error message for hex parsing if invalid.
     pub hex_error: Option<String>,
+    /// Global brightness factor (0.0 to 1.0).
+    pub brightness: f32,
+    /// Selected effect name.
+    pub selected_effect: String,
 
     /// Path to resolved control node.
     pub control_node_path: Option<PathBuf>,
@@ -281,6 +343,8 @@ impl Default for AulaF75App {
             color_rgb: initial_rgb,
             hex_input: initial_hex,
             hex_error: None,
+            brightness: 1.0,
+            selected_effect: "Solid".to_string(),
             control_node_path: detected,
             status_text,
             last_error: None,
@@ -331,25 +395,62 @@ impl AulaF75App {
         }
     }
 
+    /// Build current `Effect` based on GUI state.
+    pub fn current_effect(&self) -> Effect {
+        let base_color = RGB(self.color_rgb[0], self.color_rgb[1], self.color_rgb[2]);
+        match self.selected_effect.to_ascii_lowercase().as_str() {
+            "solid" => Effect::Solid(base_color),
+            "rainbow" => Effect::Rainbow { period_s: 5.0 },
+            "wave" => Effect::Wave { period_s: 3.0 },
+            "breathe" => Effect::Breathe {
+                color: base_color,
+                period_s: 4.0,
+            },
+            "stars" => Effect::Stars { density: 0.15 },
+            _ => Effect::Off,
+        }
+    }
+
+    /// Dispatch current effect and brightness to running worker or start a new worker.
+    pub fn dispatch_current_effect(&mut self) {
+        let effect = self.current_effect();
+        if effect == Effect::Off {
+            self.on_off_clicked();
+            return;
+        }
+
+        let msg = self.state.transition_to_effect(effect.clone(), self.brightness);
+        if let Some(ref tx) = self.worker_tx {
+            let _ = tx.send(msg);
+            self.status_text = format!("Streaming {}", self.selected_effect);
+        } else {
+            self.start_worker(msg);
+        }
+    }
+
     /// Sync RGB values from color picker or sliders to hex input and active stream.
     pub fn set_color_from_picker(&mut self, srgb: [u8; 3]) {
         self.color_rgb = srgb;
         self.hex_input = format!("{:02X}{:02X}{:02X}", srgb[0], srgb[1], srgb[2]);
         self.hex_error = None;
         if self.is_worker_running() {
-            self.send_color((srgb[0], srgb[1], srgb[2]));
+            if self.selected_effect == "Solid" || self.selected_effect == "Breathe" {
+                self.dispatch_current_effect();
+            }
         }
     }
 
     /// Dispatch color change to running worker.
     pub fn send_color(&mut self, rgb: (u8, u8, u8)) {
+        self.color_rgb = [rgb.0, rgb.1, rgb.2];
+        self.hex_input = format!("{:02X}{:02X}{:02X}", rgb.0, rgb.1, rgb.2);
         let msg = self.state.transition_to_solid(rgb);
         if let Some(ref tx) = self.worker_tx {
             let _ = tx.send(msg);
         }
     }
 
-    /// Handler for "Solid" button click.
+    /// Handler for "Solid" action button click.
     pub fn on_solid_clicked(&mut self) {
         let rgb = match parse_color_hex(&self.hex_input) {
             Ok(c) => c,
@@ -360,6 +461,7 @@ impl AulaF75App {
         };
         self.hex_error = None;
         self.color_rgb = [rgb.0, rgb.1, rgb.2];
+        self.selected_effect = "Solid".to_string();
 
         if let Some(ref tx) = self.worker_tx {
             let msg = self.state.transition_to_solid(rgb);
@@ -370,8 +472,9 @@ impl AulaF75App {
         }
     }
 
-    /// Handler for "Off" button click.
+    /// Handler for "Off" action button click.
     pub fn on_off_clicked(&mut self) {
+        self.selected_effect = "Off".to_string();
         let msg = self.state.transition_to_off();
         if let Some(ref tx) = self.worker_tx {
             let _ = tx.send(msg);
@@ -419,124 +522,213 @@ impl Drop for AulaF75App {
 
 impl eframe::App for AulaF75App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.set_visuals(egui::Visuals::dark());
         self.poll_worker_status();
 
+        // Left side panel: Hardware Status & Device Metadata
+        egui::SidePanel::left("device_info")
+            .resizable(false)
+            .default_width(210.0)
+            .show(ctx, |ui| {
+                ui.heading("Hardware Status");
+                ui.add_space(8.0);
+
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        let (indicator_color, indicator_text) = if self.is_worker_running() {
+                            (egui::Color32::from_rgb(46, 204, 113), "Streaming Active")
+                        } else if self.control_node_path.is_some() {
+                            (egui::Color32::from_rgb(241, 196, 15), "Device Connected")
+                        } else {
+                            (egui::Color32::from_rgb(231, 76, 60), "Disconnected")
+                        };
+
+                        ui.colored_label(indicator_color, "●");
+                        ui.label(indicator_text);
+                    });
+
+                    ui.add_space(4.0);
+                    ui.label("Device: AULA F75");
+                    ui.label("VID:PID: 258a:010c");
+                    ui.label("Interface: 1 (HID Feature)");
+
+                    if let Some(ref path) = self.control_node_path {
+                        ui.label(format!("Node: {}", path.display()));
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(231, 76, 60),
+                            "Node: Not Found",
+                        );
+                    }
+
+                    if let Some(ref err) = self.last_error {
+                        ui.add_space(4.0);
+                        ui.colored_label(
+                            egui::Color32::from_rgb(231, 76, 60),
+                            format!("Error: {}", err),
+                        );
+                    }
+                });
+
+                ui.add_space(16.0);
+                ui.label("Requirements:");
+                ui.label("• Udev rule (99-aula-f75.rules)");
+                ui.label("• Keyboard in Custom/Static mode (Fn shortcuts)");
+            });
+
+        // Central panel: Lighting Controls & Effect Engine
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Status Header
-            ui.heading("AULA F75 Control Panel");
+            ui.heading("RGB Lighting Control");
             ui.add_space(8.0);
 
             ui.group(|ui| {
+                // Effect selection
                 ui.horizontal(|ui| {
-                    let (indicator_color, indicator_text) = if self.is_worker_running() {
-                        (egui::Color32::from_rgb(46, 204, 113), "Streaming Active")
-                    } else if self.control_node_path.is_some() {
-                        (egui::Color32::from_rgb(241, 196, 15), "Device Connected")
-                    } else {
-                        (egui::Color32::from_rgb(231, 76, 60), "Disconnected")
-                    };
-
-                    ui.colored_label(indicator_color, "●");
-                    ui.label(format!("{}: {}", indicator_text, self.status_text));
-                });
-
-                if let Some(ref path) = self.control_node_path {
-                    ui.label(format!("Interface 1 node: {}", path.display()));
-                }
-                if let Some(ref err) = self.last_error {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(231, 76, 60),
-                        format!("Error: {}", err),
-                    );
-                }
-            });
-
-            ui.add_space(12.0);
-
-            // Lighting Controls
-            ui.group(|ui| {
-                ui.label("Direct RGB Lighting");
-                ui.add_space(6.0);
-
-                // Color picker
-                ui.horizontal(|ui| {
-                    ui.label("Color picker:");
-                    let mut srgb = self.color_rgb;
-                    if ui.color_edit_button_srgb(&mut srgb).changed() {
-                        self.set_color_from_picker(srgb);
-                    }
-                });
-
-                ui.add_space(6.0);
-
-                // Manual RGB sliders
-                ui.horizontal(|ui| {
-                    let mut r = self.color_rgb[0];
-                    let mut g = self.color_rgb[1];
-                    let mut b = self.color_rgb[2];
-                    let mut changed = false;
-
-                    if ui.add(egui::Slider::new(&mut r, 0..=255).text("R")).changed() {
-                        changed = true;
-                    }
-                    if ui.add(egui::Slider::new(&mut g, 0..=255).text("G")).changed() {
-                        changed = true;
-                    }
-                    if ui.add(egui::Slider::new(&mut b, 0..=255).text("B")).changed() {
-                        changed = true;
-                    }
-
-                    if changed {
-                        self.set_color_from_picker([r, g, b]);
-                    }
-                });
-
-                ui.add_space(6.0);
-
-                // Hex text field
-                ui.horizontal(|ui| {
-                    ui.label("Hex color:");
-                    let hex_resp = ui.text_edit_singleline(&mut self.hex_input);
-                    if hex_resp.lost_focus() || hex_resp.changed() {
-                        if let Ok(parsed) = parse_color_hex(&self.hex_input) {
-                            self.color_rgb = [parsed.0, parsed.1, parsed.2];
-                            self.hex_error = None;
-                            if self.is_worker_running() {
-                                self.send_color(parsed);
+                    ui.label("Lighting Effect:");
+                    egui::ComboBox::from_label("##effect_select")
+                        .selected_text(&self.selected_effect)
+                        .show_ui(ui, |ui| {
+                            for &eff in AVAILABLE_EFFECTS {
+                                if ui
+                                    .selectable_value(&mut self.selected_effect, eff.to_string(), eff)
+                                    .clicked()
+                                {
+                                    if self.is_worker_running() {
+                                        self.dispatch_current_effect();
+                                    }
+                                }
                             }
-                        } else if !self.hex_input.is_empty() {
-                            self.hex_error = Some(
-                                "Invalid hex format (expected 6 hex digits, e.g. FF0000 or #00FFFF)".to_string(),
-                            );
+                        });
+                });
+
+                ui.add_space(8.0);
+
+                // Parameters: Color picker & Hex input (shown for Solid and Breathe)
+                let is_color_effect = self.selected_effect == "Solid" || self.selected_effect == "Breathe";
+                if is_color_effect {
+                    ui.horizontal(|ui| {
+                        ui.label("Color picker:");
+                        let mut srgb = self.color_rgb;
+                        if ui.color_edit_button_srgb(&mut srgb).changed() {
+                            self.set_color_from_picker(srgb);
+                        }
+                    });
+
+                    ui.add_space(4.0);
+
+                    // Manual RGB sliders
+                    ui.horizontal(|ui| {
+                        let mut r = self.color_rgb[0];
+                        let mut g = self.color_rgb[1];
+                        let mut b = self.color_rgb[2];
+                        let mut changed = false;
+
+                        if ui.add(egui::Slider::new(&mut r, 0..=255).text("R")).changed() {
+                            changed = true;
+                        }
+                        if ui.add(egui::Slider::new(&mut g, 0..=255).text("G")).changed() {
+                            changed = true;
+                        }
+                        if ui.add(egui::Slider::new(&mut b, 0..=255).text("B")).changed() {
+                            changed = true;
+                        }
+
+                        if changed {
+                            self.set_color_from_picker([r, g, b]);
+                        }
+                    });
+
+                    ui.add_space(4.0);
+
+                    // Hex text field
+                    ui.horizontal(|ui| {
+                        ui.label("Hex color:");
+                        let hex_resp = ui.text_edit_singleline(&mut self.hex_input);
+                        if hex_resp.lost_focus() || hex_resp.changed() {
+                            if let Ok(parsed) = parse_color_hex(&self.hex_input) {
+                                self.color_rgb = [parsed.0, parsed.1, parsed.2];
+                                self.hex_error = None;
+                                if self.is_worker_running() {
+                                    self.dispatch_current_effect();
+                                }
+                            } else if !self.hex_input.is_empty() {
+                                self.hex_error = Some(
+                                    "Invalid hex format (expected 6 hex digits, e.g. FF0000 or #00FFFF)".to_string(),
+                                );
+                            }
+                        }
+                    });
+
+                    if let Some(ref err) = self.hex_error {
+                        ui.colored_label(egui::Color32::from_rgb(231, 76, 60), err);
+                    }
+
+                    ui.add_space(6.0);
+                }
+
+                // Brightness slider
+                ui.horizontal(|ui| {
+                    ui.label("Brightness:");
+                    let pct_label = format!("{:.0}%", self.brightness * 100.0);
+                    if ui
+                        .add(egui::Slider::new(&mut self.brightness, 0.0..=1.0).text(pct_label))
+                        .changed()
+                    {
+                        if self.is_worker_running() {
+                            self.dispatch_current_effect();
                         }
                     }
                 });
 
-                if let Some(ref err) = self.hex_error {
-                    ui.colored_label(egui::Color32::from_rgb(231, 76, 60), err);
-                }
-
                 ui.add_space(10.0);
 
-                // Solid / Off Action Buttons
+                // Action buttons: Start Streaming, Stop / Off
                 ui.horizontal(|ui| {
-                    if ui.button("Solid").clicked() {
-                        self.on_solid_clicked();
+                    if ui.button("▶ Start Streaming").clicked() {
+                        self.dispatch_current_effect();
                     }
 
-                    if ui.button("Off").clicked() {
+                    if ui.button("⏹ Stop / Off").clicked() {
                         self.on_off_clicked();
                     }
                 });
             });
 
             ui.add_space(12.0);
-            ui.label("Note: Board must be toggled into Custom/Static RGB mode (Fn shortcuts) to display software colors.");
+
+            // Status footer
+            ui.group(|ui| {
+                let tick_rate_label = if self.is_worker_running() {
+                    match self.selected_effect.to_ascii_lowercase().as_str() {
+                        "solid" => "~1.5 Hz (keepalive)",
+                        "off" => "0 Hz (stopped)",
+                        _ => "~25 Hz (active stream)",
+                    }
+                } else {
+                    "0 Hz (idle)"
+                };
+
+                let active_name = if self.is_worker_running() {
+                    &self.selected_effect
+                } else {
+                    "None"
+                };
+
+                ui.label(format!(
+                    "Active stream: {} | Tick rate: {} | {}",
+                    active_name, tick_rate_label, self.status_text
+                ));
+            });
         });
 
-        // Keep UI reactive during streaming
+        // Request repaint depending on streaming state
         if self.is_worker_running() {
-            ctx.request_repaint_after(Duration::from_millis(200));
+            let repaint_interval = if self.selected_effect == "Solid" {
+                Duration::from_millis(200)
+            } else {
+                Duration::from_millis(40)
+            };
+            ctx.request_repaint_after(repaint_interval);
         }
     }
 }

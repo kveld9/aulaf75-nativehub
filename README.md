@@ -11,6 +11,7 @@ The AULA F75 keyboard exposes USB HID interfaces (typical VID `258a`, PID `010c`
 - **Tranche 3**: Standalone Rust CLI binary (`aula-f75-rs`) with zero external native dependencies beyond `libc`.
 - **Tranche 4**: Native Rust GUI (`aula-f75-gui`) using `egui` and `eframe` with a non-blocking streaming worker thread.
 - **Tranche 5**: Per-key LED map for the AULA F75 (80 mapped key slots) and `key`/`keys` CLI subcommands.
+- **Tranche 6**: Host-rendered RGB lighting effects engine (`rainbow`, `wave`, `breathe`, `stars`, `solid`, `off`) and presentable desktop GUI panel.
 
 ## Non-Goals & Safety Rules
 
@@ -131,6 +132,21 @@ cargo build --release
 
 # Light space key in green using alias for 5 seconds
 ./target/release/aula-f75-rs key spacebar "#00FF00" --seconds 5
+
+# List all available host-rendered lighting effects
+./target/release/aula-f75-rs effects
+
+# Stream dynamic Rainbow effect indefinitely
+./target/release/aula-f75-rs fx rainbow
+
+# Stream Breathe pulsing effect in magenta
+./target/release/aula-f75-rs fx breathe --color ff00ff
+
+# Stream twinkling Stars effect at 70% brightness
+./target/release/aula-f75-rs fx stars --brightness 0.7
+
+# Stream Wave effect for 10 seconds
+./target/release/aula-f75-rs fx wave --seconds 10
 ```
 
 > [!NOTE]
@@ -142,7 +158,7 @@ cargo build --release
 
 ## Rust GUI (`aula-f75-gui`)
 
-Tranche 4 provides a native Linux desktop GUI application built with `eframe` and `egui`, reusing the verified direct RGB protocol and device resolution logic from the core crate.
+Tranche 4 and Tranche 6 provide a native Linux desktop GUI application built with `eframe` and `egui` (0.31), featuring a dark sober two-panel layout, direct RGB lighting control, and continuous host-rendered effect streaming.
 
 ### Requirements
 
@@ -164,11 +180,12 @@ Alternatively, run the compiled release binary:
 
 ### Features
 
-- **Reactive Status Header**: Displays connection indicator, resolved `/dev/hidraw*` interface 1 control node path, and surfaces any permission or disconnection errors without panicking.
-- **Color Controls**: Interactive color picker widget, manual RGB channel sliders, and hex text field supporting 6-digit hex values (e.g. `FF0000` or `#00FFFF`).
-- **Non-Blocking Streaming Worker**: Direct RGB keepalive frames are transmitted at ~1.5 Hz (`KEEPALIVE_HZ`) on a dedicated background thread, matching the CLI retry and backoff behavior on transient communication errors. The UI rendering thread is never blocked on USB I/O.
-- **Solid & Off Actions**: "Solid" starts or updates the continuous direct RGB keepalive stream. "Off" sends an all-zero frame to turn off lighting, cleanly terminates the worker thread, and closes the device descriptor.
-- **Clean Lifecycle**: Closing the application window signals worker termination, joins the thread, and closes the file descriptor with zero resource leaks.
+- **Side Panel Hardware Status**: Left side panel displays live device connection status (indicator dot, device model, VID/PID `258a:010c`, interface 1 node path, and error diagnostics).
+- **Effect Selection**: Dropdown selector supporting `Solid`, `Rainbow`, `Wave`, `Breathe`, `Stars`, and `Off`.
+- **Dynamic Parameters**: Color picker and hex input field enabled for color-dependent modes (`Solid`, `Breathe`); global brightness slider (`0%..=100%`) applied smoothly across all effects.
+- **Non-Blocking Streaming Worker**: Direct Report 6 frames are streamed at ~25 Hz (`Duration::from_millis(40)`) for fluid animations and ~1.5 Hz (`KEEPALIVE_HZ`) for solid keepalive on a dedicated background thread with transient error retry (`EPIPE`, `ETIMEDOUT`). The UI rendering thread is never blocked.
+- **Start / Stop Controls**: Dedicated "Start Streaming" and "Stop / Off" buttons with live footer reporting active stream name, estimated tick rate, and hardware communication status.
+- **Clean Lifecycle**: Window close signals worker termination, joins the thread, and cleanly drops the device descriptor.
 
 > [!NOTE]
 > **CUSTOM Mode Requirement**: The physical keyboard must be toggled into its onboard "Custom" / user static RGB mode (via onboard Fn shortcuts) for software-driven colors to display.

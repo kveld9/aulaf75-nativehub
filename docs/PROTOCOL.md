@@ -77,6 +77,14 @@ The AULA F75 75% physical matrix provides 80 mapped LED slots (max slot index 89
 - **Keepalive Invariant**: Per-key lighting follows the same keepalive requirement as full-board solid colors: frames must be resent at ~1.5 Hz (`KEEPALIVE_HZ`) to prevent the keyboard from reverting to onboard lighting patterns.
 - **Credit & Status**: Key-to-slot mapping cross-checked against OpenRGB Sinowealth 010C driver (`aula_f75_layout`); hardware-free test suite verified; live hardware verification pending.
 
+### 3.2 Host-Rendered RGB Effects Engine
+
+To replicate vendor onboard lighting effects without touching dangerous or unverified feature reports (such as Report 5), all dynamic animations (`rainbow`, `wave`, `breathe`, `stars`) and static color modes (`solid`, `off`) are rendered purely on the host CPU and continuously streamed to the keyboard via Report 6 frames.
+
+- **Streaming Transport**: Standard 520-byte Report 6 feature reports sent to interface 1 (`/dev/hidraw*`).
+- **Refresh Rates**: Dynamic effects stream at ~25 Hz (`Duration::from_millis(40)` or tick frequency `25.0 Hz`) to achieve smooth perceptual color transitions; static `solid` mode streams at ~1.5 Hz (`KEEPALIVE_HZ`) to maintain the hardware keepalive latch.
+- **Safety Invariant**: All host effects stream strictly on verified Report 6. Blind writes to Report 5 or non-verified configuration mailboxes remain strictly prohibited.
+
 ---
 
 ## 4. Credits
