@@ -1,0 +1,16 @@
+[Unit]
+Description=AULA F75 RGB Lighting Service
+Documentation=https://github.com/
+After=default.target
+
+[Service]
+Type=simple
+# Default lighting: dim warm solid hold (#303030).
+# To load a saved profile instead (e.g. 'default' or 'work'), replace ExecStart with:
+# ExecStart=%h/.local/bin/aula-f75-rs profile load <name>
+ExecStart=%h/.local/bin/aula-f75-rs solid 303030
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=default.target

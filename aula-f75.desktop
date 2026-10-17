@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=AULA F75 Keyboard
+Comment=Native Linux configuration utility and RGB controller for AULA F75
+Exec=aula-f75-gui
+Icon=keyboard
+Terminal=false
+Categories=Utility;
+Keywords=keyboard;rgb;lighting;aula;f75;

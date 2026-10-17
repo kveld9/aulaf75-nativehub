@@ -14,6 +14,7 @@ The AULA F75 keyboard exposes USB HID interfaces (typical VID `258a`, PID `010c`
 - **Tranche 6**: Host-rendered RGB lighting effects engine (`rainbow`, `wave`, `breathe`, `stars`, `solid`, `off`) and presentable desktop GUI panel.
 - **Tranche 7**: Local lighting profiles (`save`, `load`, `list`, `delete`, `show`) for effects, colors, brightness, and per-key overrides with XDG flat file persistence and desktop GUI integration.
 - **Tranche 8**: System-audio reactive lighting (music mode) with real-time Cooley-Tukey FFT, log-spaced frequency bands, AutoGain, and host-rendered Report 6 direct frames across CLI and GUI.
+- **Tranche 9**: Packaging, desktop launcher (`aula-f75.desktop`), user systemd service (`aula-f75.service`), automated installer (`install.sh`), and retirement of the initial Python prototype (fully superseded by native Rust binaries).
 
 ## Non-Goals & Safety Rules
 
@@ -22,38 +23,105 @@ The AULA F75 keyboard exposes USB HID interfaces (typical VID `258a`, PID `010c`
 - **Hard Safety Rule — Report 5 Prohibition**: Never send data on Report ID 5. On this MCU family, Report 5 is a write-only command mailbox where blind writes risk entering the ISP firmware-flash bootloader (soft-brick). Report 5 remains unimplemented and prohibited.
 - **No Blind Protocol Writes**: Non-verified feature-report writes (key remapping, macros) remain disabled until payload structures are verified.
 
-## Udev Rule Setup
+## Python Prototype Retirement
 
-By default, `/dev/hidraw*` device nodes require elevated privileges. Install the provided udev rule to grant unprivileged user access via `uaccess` and mode `0666`:
-
-```bash
-sudo cp 99-aula-f75.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules && sudo udevadm trigger
-```
+The original Python prototype (`aula_f75/`, `pyproject.toml`) developed in Tranches 1 and 2 served as the initial reverse-engineering harness and protocol verification testbed. With the completion of the standalone native Rust toolchain (`aula-f75-rs` CLI and `aula-f75-gui` desktop app), the Python prototype has been retired and removed from the repository. The Rust implementation is self-contained, high-performance, and has zero external runtime dependencies beyond `libc`.
 
 ## Installation
 
+### Prerequisites
+
+- **Rust toolchain** (1.70+ / Edition 2021) with `cargo` (via [rustup](https://rustup.rs)).
+- **Linux kernel** with USB HID (`hidraw`) support.
+- **Sudo privileges** for installing the udev rule (`99-aula-f75.rules`) into `/etc/udev/rules.d/`.
+- **Audio utilities** (for `music` mode only): `pipewire-pulse` or `pulseaudio-utils` (provides `parec` and `pactl`).
+
+### Automated Installation
+
+Run the provided `install.sh` script from the repository root:
+
 ```bash
-pip install .
+./install.sh
 ```
 
-For development and testing:
+The installer performs the following actions:
+1. Builds release binaries (`aula-f75-rs` and `aula-f75-gui`) via `cargo build --release`.
+2. Installs both binaries to `${HOME}/.local/bin/`.
+3. Installs `99-aula-f75.rules` to `/etc/udev/rules.d/` (prompting for sudo) and reloads udev rules via `udevadm`.
+4. Installs `aula-f75.desktop` to `${XDG_DATA_HOME:-~/.local/share}/applications/`.
+5. Installs `aula-f75.service` to `${XDG_CONFIG_HOME:-~/.config}/systemd/user/`.
+
+### Manual Build & Installation
+
+If preferred, build and install components manually:
 
 ```bash
-pip install .[test]
-pytest -q
+# Build release binaries
+cd rust
+cargo build --release
+
+# Copy binaries to ~/.local/bin
+install -Dm755 target/release/aula-f75-rs ~/.local/bin/aula-f75-rs
+install -Dm755 target/release/aula-f75-gui ~/.local/bin/aula-f75-gui
+
+# Install udev rule (requires sudo)
+sudo install -Dm644 ../99-aula-f75.rules /etc/udev/rules.d/99-aula-f75.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger
+
+# Install desktop entry
+install -Dm644 ../aula-f75.desktop ~/.local/share/applications/aula-f75.desktop
+
+# Install user systemd service
+install -Dm644 ../aula-f75.service ~/.config/systemd/user/aula-f75.service
+systemctl --user daemon-reload
 ```
 
-All test suites are strictly hardware-free and execute against mockable backends.
+### Systemd User Service
 
-## CLI Usage
+To automatically apply default RGB lighting upon user login, enable the installed systemd user unit:
+
+```bash
+systemctl --user enable --now aula-f75.service
+```
+
+By default, the service executes `aula-f75-rs solid 303030` (dim warm hold). To apply a saved lighting profile on login instead (e.g. `default` or `work`), update `ExecStart` in `~/.config/systemd/user/aula-f75.service`:
+
+```ini
+ExecStart=%h/.local/bin/aula-f75-rs profile load work
+```
+
+### Uninstallation
+
+To remove all installed components:
+
+```bash
+# Remove installed binaries
+rm -f ~/.local/bin/aula-f75-rs ~/.local/bin/aula-f75-gui
+
+# Remove desktop entry
+rm -f ~/.local/share/applications/aula-f75.desktop
+update-desktop-database ~/.local/share/applications/ 2>/dev/null || true
+
+# Stop, disable, and remove user systemd service
+systemctl --user disable --now aula-f75.service 2>/dev/null || true
+rm -f ~/.config/systemd/user/aula-f75.service
+systemctl --user daemon-reload 2>/dev/null || true
+
+# Remove udev rule (requires sudo)
+sudo rm -f /etc/udev/rules.d/99-aula-f75.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+## CLI Usage (`aula-f75-rs`)
+
+The standalone Linux CLI binary (`aula-f75-rs`) operates with zero runtime dependencies beyond `libc`.
 
 ### Enumerate HID devices
 
-Detects system HID interfaces and flags matching AULA F75 hardware:
+Detects system HID interfaces and flags matching AULA F75 hardware via sysfs:
 
 ```bash
-aula-f75 list
+aula-f75-rs list
 ```
 
 ### Inspect device details
@@ -62,10 +130,10 @@ Displays detailed hardware metadata for detected AULA hardware or a specific dev
 
 ```bash
 # Inspect first detected AULA F75 device
-aula-f75 info
+aula-f75-rs info
 
 # Inspect a specific hidraw path
-aula-f75 info --path /dev/hidraw0
+aula-f75-rs info --path /dev/hidraw0
 ```
 
 ### Set solid RGB color
@@ -74,10 +142,10 @@ Sets whole-board static color using a 6-digit hex string (with or without `#`):
 
 ```bash
 # Set solid red indefinitely (until Ctrl+C)
-aula-f75 solid ff0000
+aula-f75-rs solid FF0000
 
-# Set solid cyan with leading hash for 5 seconds
-aula-f75 solid "#00ffff" --seconds 5
+# Set solid cyan for 5 seconds
+aula-f75-rs solid "#00FFFF" --seconds 5
 ```
 
 > [!NOTE]
@@ -91,85 +159,64 @@ aula-f75 solid "#00ffff" --seconds 5
 Turns off keyboard lighting by sending all-zero frames for ~2 seconds:
 
 ```bash
-aula-f75 off
+aula-f75-rs off
 ```
 
-## Rust CLI (`aula-f75-rs`)
-
-Tranche 3 provides a standalone Linux CLI binary in Rust with zero runtime dependencies beyond `libc`.
-
-### Building
+### Key Mapping & Per-Key RGB
 
 ```bash
-cd rust
-cargo build --release
-```
-
-> [!NOTE]
-> The initial build requires network connectivity to fetch dependencies (`clap` and `libc`) from crates.io. Subsequent builds and the test gate are offline-safe.
-
-### Running
-
-```bash
-# Set solid red indefinitely (until Ctrl+C)
-./target/release/aula-f75-rs solid FF0000
-
-# Set solid cyan for 5 seconds
-./target/release/aula-f75-rs solid "#00FFFF" --seconds 5
-
-# Turn off lighting (solid 000000 for ~2s)
-./target/release/aula-f75-rs off
-
-# Enumerate HID devices via sysfs
-./target/release/aula-f75-rs list
-
-# Inspect device metadata
-./target/release/aula-f75-rs info
-
 # List all supported key names and slot numbers
-./target/release/aula-f75-rs keys
+aula-f75-rs keys
 
 # Set RGB color for a specific named key (e.g. Esc in red)
-./target/release/aula-f75-rs key esc FF0000
+aula-f75-rs key esc FF0000
 
 # Light space key in green using alias for 5 seconds
-./target/release/aula-f75-rs key spacebar "#00FF00" --seconds 5
+aula-f75-rs key spacebar "#00FF00" --seconds 5
+```
 
+### Host-Rendered Lighting Effects
+
+```bash
 # List all available host-rendered lighting effects
-./target/release/aula-f75-rs effects
+aula-f75-rs effects
 
 # Stream dynamic Rainbow effect indefinitely
-./target/release/aula-f75-rs fx rainbow
+aula-f75-rs fx rainbow
 
 # Stream Breathe pulsing effect in magenta
-./target/release/aula-f75-rs fx breathe --color ff00ff
+aula-f75-rs fx breathe --color ff00ff
 
 # Stream twinkling Stars effect at 70% brightness
-./target/release/aula-f75-rs fx stars --brightness 0.7
+aula-f75-rs fx stars --brightness 0.7
 
 # Stream Wave effect for 10 seconds
-./target/release/aula-f75-rs fx wave --seconds 10
+aula-f75-rs fx wave --seconds 10
+```
 
+### Local Lighting Profiles
+
+```bash
 # Save a local profile with an effect and brightness
-./target/release/aula-f75-rs profile save rainbow-chill --effect rainbow --brightness 0.8
+aula-f75-rs profile save rainbow-chill --effect rainbow --brightness 0.8
 
 # Save a solid color profile
-./target/release/aula-f75-rs profile save cyan-work --effect solid --color 00FFFF --brightness 0.5
+aula-f75-rs profile save cyan-work --effect solid --color 00FFFF --brightness 0.5
 
 # Save a per-key gaming profile (WASD in red, space in green)
-./target/release/aula-f75-rs profile save fps-wasd --effect off --key w=FF0000 --key a=FF0000 --key s=FF0000 --key d=FF0000 --key space=00FF00
+aula-f75-rs profile save fps-wasd --effect off --key w=FF0000 --key a=FF0000 --key s=FF0000 --key d=FF0000 --key space=00FF00
 
 # List saved profiles
-./target/release/aula-f75-rs profile list
+aula-f75-rs profile list
 
 # Show profile configuration details
-./target/release/aula-f75-rs profile show fps-wasd
+aula-f75-rs profile show fps-wasd
 
 # Load and apply a profile (effect or per-key overrides)
-./target/release/aula-f75-rs profile load rainbow-chill
+aula-f75-rs profile load rainbow-chill
 
 # Delete a profile
-./target/release/aula-f75-rs profile delete cyan-work
+aula-f75-rs profile delete cyan-work
 ```
 
 > [!NOTE]
@@ -191,14 +238,15 @@ Tranche 4 and Tranche 6 provide a native Linux desktop GUI application built wit
 ### Running
 
 ```bash
+# If installed via install.sh
+aula-f75-gui
+
+# Or run from release build directory
+./target/release/aula-f75-gui
+
+# Or run via cargo
 cd rust
 cargo run --bin aula-f75-gui
-```
-
-Alternatively, run the compiled release binary:
-
-```bash
-./target/release/aula-f75-gui
 ```
 
 ### Features

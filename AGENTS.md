@@ -3,7 +3,7 @@
 ## Core Principles
 
 - **Linux-Native Only**: Direct Linux kernel USB HID interface via `hidraw`. Wine, Proton, Windows emulation, or vendor PE executable wrappers are strictly out of scope.
-- **Target Runtime**: Python 3.10+ (tested on Python 3.14) on Linux with standard library `os` and `fcntl` for raw `hidraw` ioctls; optional `hidapi` C-extension for discovery. Rust edition 2021+ for the standalone CLI binary (`aula-f75-rs`) and native desktop GUI (`aula-f75-gui`) via `egui`/`eframe`.
+- **Target Runtime**: Rust edition 2021+ on Linux for the standalone CLI binary (`aula-f75-rs`) and native desktop GUI (`aula-f75-gui`) via `egui`/`eframe`. Direct Linux kernel USB HID interface via `hidraw` ioctls with zero Python runtime dependencies.
 - **Language**: All user-facing text, documentation, error messages, and commit messages must be strictly in English.
 
 ## Direct RGB Protocol & Safety Rules
@@ -19,12 +19,10 @@
 
 ## Testing & Quality Gates
 
-- **Verification Gate**:
-  - Python: `pytest -q`
-  - Rust: `cargo test` (executed inside `rust/`; tests CLI logic, keymap frame offsets/uniqueness, GUI state/channel streaming, local profiles, and music mode audio reactivity; skips GUI window rendering; offline-safe once crates.io dependencies are fetched)
+- **Verification Gate**: `cargo test` (executed inside `rust/`; tests CLI logic, keymap frame offsets/uniqueness, GUI state/channel streaming, local profiles, and music mode audio reactivity; skips GUI window rendering; offline-safe once crates.io dependencies are fetched).
 - **Hardware-Free Unit Tests**: Never require physical hardware in the test suite. All device interactions must use dependency injection:
-  - Discovery: sysfs-first resolution via `resolve_control_node()` with mockable backend parameter in `find_devices()` and `open_device()`, and injectable sysfs base paths in Rust (`resolve_control_node_with_roots()`).
-  - RGB writes: injectable `opener` and `ioctl_fn` parameters in Python `send_frame()` and `main()`; mockable closures/injectable functions in Rust (`send_with_retry`, `run_keepalive_loop`, `send_key_frame`, `run_worker_stream`) so unit tests never invoke real `fcntl`/`ioctl` or touch real hardware device nodes.
+  - Discovery: sysfs-first resolution via `resolve_control_node()` with injectable sysfs base paths in Rust (`resolve_control_node_with_roots()`).
+  - RGB writes: mockable closures and injectable functions in Rust (`send_with_retry`, `run_keepalive_loop`, `send_key_frame`, `run_worker_stream`) so unit tests never invoke real `fcntl`/`ioctl` or touch real hardware device nodes.
   - Key mapping: frame offset verification (e.g. esc at bytes 8..10, space at 8+35*3), alias resolution, slot uniqueness (< 170), and key enumeration (>= 80 keys) verified purely in-memory.
   - GUI state: pure state machine transitions (`transition_to_solid`, `transition_to_off`), hex parsing, and channel stream tests (`run_worker_stream`) executed with mock transmitters and receivers without spawning active GUI windows or connecting to hardware.
   - Profiles: local flat file roundtrips, strict file:line syntax and semantic validation, alphabetical listing, env directory overrides, and fake runner execution tested in temporary directories without hardware dependencies.
