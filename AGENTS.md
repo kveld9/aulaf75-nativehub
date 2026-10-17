@@ -3,7 +3,7 @@
 ## Core Principles
 
 - **Linux-Native Only**: Direct Linux kernel USB HID interface via `hidraw`. Wine, Proton, Windows emulation, or vendor PE executable wrappers are strictly out of scope.
-- **Target Runtime**: Python 3.10+ (tested on Python 3.14) on Linux with standard library `os` and `fcntl` for raw `hidraw` ioctls; optional `hidapi` C-extension for discovery.
+- **Target Runtime**: Python 3.10+ (tested on Python 3.14) on Linux with standard library `os` and `fcntl` for raw `hidraw` ioctls; optional `hidapi` C-extension for discovery. Rust edition 2021+ for the standalone CLI binary (`aula-f75-rs`) via direct `libc` ioctls with zero native deps beyond `libc`.
 - **Language**: All user-facing text, documentation, error messages, and commit messages must be strictly in English.
 
 ## Direct RGB Protocol & Safety Rules
@@ -18,10 +18,11 @@
 
 ## Testing & Quality Gates
 
-- **Verification Gate**: `pytest -q`. All unit tests must pass cleanly.
+- **Verification Gate**:
+  - Python: `pytest -q`
+  - Rust: `cargo test` (executed inside `rust/`; offline-safe once crates.io dependencies are fetched)
 - **Hardware-Free Unit Tests**: Never require physical hardware in the test suite. All device interactions must use dependency injection:
-  - Discovery: sysfs-first resolution via `resolve_control_node()` with mockable backend parameter in `find_devices()` and `open_device()`.
-
-  - RGB writes: injectable `opener` and `ioctl_fn` parameters in `send_frame()` and `main()` so unit tests never invoke real `fcntl` or touch real hardware device nodes.
+  - Discovery: sysfs-first resolution via `resolve_control_node()` with mockable backend parameter in `find_devices()` and `open_device()`, and injectable sysfs base paths in Rust (`resolve_control_node_with_roots()`).
+  - RGB writes: injectable `opener` and `ioctl_fn` parameters in Python `send_frame()` and `main()`; mockable closures/injectable functions in Rust (`send_with_retry`, `run_keepalive_loop`) so unit tests never invoke real `fcntl`/`ioctl` or touch real hardware device nodes.
 - **Scope Discipline**: Work within designated file-system boundaries and deliver clean, atomic changes.
 

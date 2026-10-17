@@ -8,6 +8,7 @@ The AULA F75 keyboard exposes USB HID interfaces (typical VID `258a`, PID `010c`
 
 - **Tranche 1**: Repository scaffolding, injectable device abstractions, and read-only device inspection.
 - **Tranche 2**: Verified direct RGB lighting write paths (`solid`, `off`) using Linux stdlib `hidraw` ioctls on interface 1.
+- **Tranche 3**: Standalone Rust CLI binary (`aula-f75-rs`) with zero external native dependencies beyond `libc`.
 
 ## Non-Goals & Safety Rules
 
@@ -86,5 +87,47 @@ Turns off keyboard lighting by sending all-zero frames for ~2 seconds:
 
 ```bash
 aula-f75 off
+```
+
+## Rust CLI (`aula-f75-rs`)
+
+Tranche 3 provides a standalone Linux CLI binary in Rust with zero runtime dependencies beyond `libc`.
+
+### Building
+
+```bash
+cd rust
+cargo build --release
+```
+
+> [!NOTE]
+> The initial build requires network connectivity to fetch dependencies (`clap` and `libc`) from crates.io. Subsequent builds and the test gate are offline-safe.
+
+### Running
+
+```bash
+# Set solid red indefinitely (until Ctrl+C)
+./target/release/aula-f75-rs solid FF0000
+
+# Set solid cyan for 5 seconds
+./target/release/aula-f75-rs solid "#00FFFF" --seconds 5
+
+# Turn off lighting (solid 000000 for ~2s)
+./target/release/aula-f75-rs off
+
+# Enumerate HID devices via sysfs
+./target/release/aula-f75-rs list
+
+# Inspect device metadata
+./target/release/aula-f75-rs info
+```
+
+### Verification Gate
+
+All unit and integration tests are strictly hardware-free and testable without physical devices:
+
+```bash
+cd rust
+cargo test
 ```
 

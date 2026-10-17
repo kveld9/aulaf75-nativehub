@@ -1,0 +1,16 @@
+[package]
+name = "aula-f75"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+name = "aula_f75"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aula-f75-rs"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"

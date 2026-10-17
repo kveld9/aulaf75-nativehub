@@ -17,3 +17,6 @@ dist/
 # Reference captures and raw dumps
 reference/
 captures/
+
+# Rust build target
+target/
