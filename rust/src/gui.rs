@@ -15,6 +15,7 @@ use std::time::Duration;
 use eframe::egui;
 
 pub use crate::cli::parse_color_hex;
+use crate::cli::music::{self, MusicMode};
 use crate::cli::profile::{self, Profile};
 use crate::device;
 use crate::effects::{self, Effect, RGB};
@@ -42,6 +43,12 @@ pub enum WorkerMessage {
     },
     /// Stream a per-key direct RGB frame lighting specific keys.
     SetKeyFrame(Vec<(String, (u8, u8, u8))>),
+    /// Stream music-reactive lighting based on system audio.
+    SetMusic {
+        mode: MusicMode,
+        color: (u8, u8, u8),
+        gain: f32,
+    },
     /// Transmit all-zero off frame and cleanly stop the keepalive loop.
     Off,
     /// Immediately terminate keepalive loop and close device descriptor.
@@ -49,7 +56,7 @@ pub enum WorkerMessage {
 }
 
 /// Status and lifecycle events emitted by the background worker.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WorkerStatus {
     /// Worker successfully opened device node and entered keepalive loop.
     Running(PathBuf),
@@ -57,6 +64,8 @@ pub enum WorkerStatus {
     Stopped,
     /// An error occurred during device resolution, opening, or ioctl execution.
     Error(String),
+    /// Periodic snapshot of music band energies for GUI level meter.
+    MusicBands(Vec<f32>),
 }
 
 /// Lighting mode state in the GUI state machine.
@@ -68,6 +77,11 @@ pub enum GuiLightingMode {
     Solid,
     /// Actively transmitting a host-rendered effect.
     Effect(Effect),
+    /// Actively transmitting music-reactive frames.
+    Music {
+        mode: MusicMode,
+        gain: f32,
+    },
 }
 
 /// State tracking for lighting mode, color, and active effect transitions.
@@ -104,6 +118,18 @@ impl GuiState {
         WorkerMessage::SetEffect { effect, brightness }
     }
 
+    /// Transition to Music mode with the requested mode, color, and gain.
+    pub fn transition_to_music(
+        &mut self,
+        mode: MusicMode,
+        color: (u8, u8, u8),
+        gain: f32,
+    ) -> WorkerMessage {
+        self.mode = GuiLightingMode::Music { mode, gain };
+        self.rgb = color;
+        WorkerMessage::SetMusic { mode, color, gain }
+    }
+
     /// Transition to Off mode.
     pub fn transition_to_off(&mut self) -> WorkerMessage {
         self.mode = GuiLightingMode::Off;
@@ -132,30 +158,142 @@ pub fn run_worker_stream<F, S>(
     F: FnMut(&[u8; proto::FRAME_LEN]) -> Result<(), std::io::Error>,
     S: FnMut(Duration),
 {
-    let (mut current_effect, mut current_brightness, mut current_keys) = match initial_cmd {
-        WorkerMessage::SetColor(rgb) => (Effect::Solid(RGB(rgb.0, rgb.1, rgb.2)), 1.0f32, None),
-        WorkerMessage::SetEffect { effect, brightness } => (effect, brightness, None),
-        WorkerMessage::SetKeyFrame(keys) => (Effect::Off, 1.0f32, Some(keys)),
-        WorkerMessage::Off => {
-            if let Ok(off_frame) = proto::build_direct_frame((0, 0, 0)) {
-                let _ = send_fn(&off_frame);
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let (mut current_effect, mut current_brightness, mut current_keys, mut current_music) =
+        match initial_cmd {
+            WorkerMessage::SetColor(rgb) => {
+                (Effect::Solid(RGB(rgb.0, rgb.1, rgb.2)), 1.0f32, None, None)
             }
-            let _ = status_tx.send(WorkerStatus::Stopped);
-            return;
-        }
-        WorkerMessage::Stop => {
-            let _ = status_tx.send(WorkerStatus::Stopped);
-            return;
-        }
-    };
+            WorkerMessage::SetEffect { effect, brightness } => (effect, brightness, None, None),
+            WorkerMessage::SetKeyFrame(keys) => (Effect::Off, 1.0f32, Some(keys), None),
+            WorkerMessage::SetMusic { mode, color, gain } => {
+                (Effect::Off, 1.0f32, None, Some((mode, color, gain)))
+            }
+            WorkerMessage::Off => {
+                if let Ok(off_frame) = proto::build_direct_frame((0, 0, 0)) {
+                    let _ = send_fn(&off_frame);
+                }
+                let _ = status_tx.send(WorkerStatus::Stopped);
+                return;
+            }
+            WorkerMessage::Stop => {
+                let _ = status_tx.send(WorkerStatus::Stopped);
+                return;
+            }
+        };
 
     let mut consecutive_failures = 0;
     let key_slots = proto::all_key_slots();
     let stream_start = std::time::Instant::now();
 
+    let mut music_child: Option<ChildGuard> = None;
+    let mut music_sample_buf = std::collections::VecDeque::with_capacity(2048);
+    let mut music_mags = vec![0.0f32; 512];
+    let mut music_autogain = music::AutoGain::new();
+    let music_plan = music::FftPlan::new(1024);
+
     'outer: loop {
         let t = stream_start.elapsed().as_secs_f64();
-        let frame = if let Some(ref keys) = current_keys {
+
+        // Spawn or maintain audio monitor child process if in music mode
+        if let Some((_, _, gain)) = current_music {
+            if music_child.is_none() {
+                match music::spawn_monitor() {
+                    Ok(child) => {
+                        if let Some(ref stdout) = child.stdout {
+                            let fd = stdout.as_raw_fd();
+                            unsafe {
+                                let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+                                if flags >= 0 {
+                                    libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                                }
+                            }
+                        }
+                        music_child = Some(ChildGuard(child));
+                    }
+                    Err(e) => {
+                        let _ = status_tx.send(WorkerStatus::Error(e));
+                        current_music = None;
+                    }
+                }
+            }
+
+            // Non-blocking read of available audio samples
+            let mut read_failed = false;
+            if let Some(ref mut guard) = music_child {
+                if let Some(ref mut stdout) = guard.0.stdout {
+                    let mut chunk_buf = [0u8; 8820];
+                    loop {
+                        match std::io::Read::read(stdout, &mut chunk_buf) {
+                            Ok(0) => {
+                                read_failed = true;
+                                break;
+                            }
+                            Ok(n) => {
+                                let num_samples = n / 4;
+                                for i in 0..num_samples {
+                                    let offset = i * 4;
+                                    let left = i16::from_le_bytes([chunk_buf[offset], chunk_buf[offset + 1]]);
+                                    let right = i16::from_le_bytes([chunk_buf[offset + 2], chunk_buf[offset + 3]]);
+                                    let mono = ((left as f32 + right as f32) / (2.0 * 32768.0)) * gain;
+                                    music_sample_buf.push_back(mono);
+                                }
+                                while music_sample_buf.len() > 1024 {
+                                    music_sample_buf.pop_front();
+                                }
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                break;
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                                continue;
+                            }
+                            Err(_) => {
+                                read_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if read_failed {
+                music_child = None;
+                current_music = None;
+            }
+        }
+
+        let frame = if let Some((mode, color, _)) = current_music {
+            if music_sample_buf.len() >= 1024 {
+                let block: Vec<f32> = music_sample_buf.iter().copied().collect();
+                music_plan.compute(&block, &mut music_mags);
+                let band_energies = music::bands_with_autogain(&music_mags, 16, 44100.0, &mut music_autogain);
+                let _ = status_tx.send(WorkerStatus::MusicBands(band_energies.clone()));
+                let pairs = music::bands_to_colors(&band_energies, color, mode);
+                match proto::build_slot_frame(&pairs) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = status_tx.send(WorkerStatus::Error(format!("Frame build error: {}", e)));
+                        break;
+                    }
+                }
+            } else {
+                match proto::build_direct_frame((0, 0, 0)) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = status_tx.send(WorkerStatus::Error(format!("Frame build error: {}", e)));
+                        break;
+                    }
+                }
+            }
+        } else if let Some(ref keys) = current_keys {
             let borrowed: Vec<(&str, (u8, u8, u8))> =
                 keys.iter().map(|(k, c)| (k.as_str(), *c)).collect();
             match proto::build_key_frame(&borrowed) {
@@ -227,7 +365,9 @@ pub fn run_worker_stream<F, S>(
             }
         }
 
-        let tick_interval = if current_keys.is_some() {
+        let tick_interval = if current_music.is_some() {
+            Duration::from_millis(50)
+        } else if current_keys.is_some() {
             interval
         } else {
             match current_effect {
@@ -242,27 +382,40 @@ pub fn run_worker_stream<F, S>(
             let poll_step = remaining.min(Duration::from_millis(10));
             match rx.recv_timeout(poll_step) {
                 Ok(WorkerMessage::SetColor(new_color)) => {
+                    current_music = None;
+                    music_child = None;
                     current_keys = None;
                     current_effect = Effect::Solid(RGB(new_color.0, new_color.1, new_color.2));
                     break;
                 }
                 Ok(WorkerMessage::SetEffect { effect, brightness }) => {
+                    current_music = None;
+                    music_child = None;
                     current_keys = None;
                     current_effect = effect;
                     current_brightness = brightness;
                     break;
                 }
                 Ok(WorkerMessage::SetKeyFrame(keys)) => {
+                    current_music = None;
+                    music_child = None;
                     current_keys = Some(keys);
                     break;
                 }
+                Ok(WorkerMessage::SetMusic { mode, color, gain }) => {
+                    current_keys = None;
+                    current_music = Some((mode, color, gain));
+                    break;
+                }
                 Ok(WorkerMessage::Off) => {
+                    music_child = None;
                     if let Ok(off_frame) = proto::build_direct_frame((0, 0, 0)) {
                         let _ = send_fn(&off_frame);
                     }
                     break 'outer;
                 }
                 Ok(WorkerMessage::Stop) => {
+                    music_child = None;
                     break 'outer;
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -273,6 +426,7 @@ pub fn run_worker_stream<F, S>(
         }
     }
 
+    drop(music_child);
     let _ = status_tx.send(WorkerStatus::Stopped);
 }
 
@@ -354,6 +508,13 @@ pub struct AulaF75App {
     /// Feedback status message specific to profile operations.
     pub profile_status: Option<String>,
 
+    /// Selected music reactive mode (Bars, Pulse).
+    pub music_mode: MusicMode,
+    /// Gain multiplier for music mode (0.1..=5.0).
+    pub music_gain: f32,
+    /// Last received audio band energies for level meter.
+    pub last_music_bands: Vec<f32>,
+
     /// Channel sender to worker thread.
     worker_tx: Option<Sender<WorkerMessage>>,
     /// Channel receiver for status events from worker thread.
@@ -392,6 +553,9 @@ impl Default for AulaF75App {
             selected_profile: initial_selected,
             profile_name_input: String::new(),
             profile_status: None,
+            music_mode: MusicMode::Bars,
+            music_gain: 1.0,
+            last_music_bands: Vec::new(),
             worker_tx: None,
             status_rx: None,
             worker_handle: None,
@@ -410,6 +574,11 @@ impl AulaF75App {
         self.worker_handle.is_some()
     }
 
+    /// Check if music reactive mode is actively streaming.
+    pub fn is_music_running(&self) -> bool {
+        self.is_worker_running() && matches!(self.state.mode, GuiLightingMode::Music { .. })
+    }
+
     /// Poll worker status channel non-blockingly and update UI state.
     pub fn poll_worker_status(&mut self) {
         if let Some(ref rx) = self.status_rx {
@@ -426,6 +595,7 @@ impl AulaF75App {
                             let _ = handle.join();
                         }
                         self.state.mode = GuiLightingMode::Off;
+                        self.last_music_bands.clear();
                         if self.last_error.is_none() {
                             self.status_text = "Idle (Lighting off)".to_string();
                         }
@@ -434,8 +604,23 @@ impl AulaF75App {
                         self.last_error = Some(err.clone());
                         self.status_text = format!("Error: {}", err);
                     }
+                    WorkerStatus::MusicBands(bands) => {
+                        self.last_music_bands = bands;
+                    }
                 }
             }
+        }
+    }
+
+    /// Dispatch music reactive lighting to running worker or start a new worker.
+    pub fn start_music(&mut self) {
+        let rgb = (self.color_rgb[0], self.color_rgb[1], self.color_rgb[2]);
+        let msg = self.state.transition_to_music(self.music_mode, rgb, self.music_gain);
+        if let Some(ref tx) = self.worker_tx {
+            let _ = tx.send(msg);
+            self.status_text = format!("Streaming music ({})", self.music_mode);
+        } else {
+            self.start_worker(msg);
         }
     }
 
@@ -478,7 +663,9 @@ impl AulaF75App {
         self.hex_input = format!("{:02X}{:02X}{:02X}", srgb[0], srgb[1], srgb[2]);
         self.hex_error = None;
         if self.is_worker_running() {
-            if self.selected_effect == "Solid" || self.selected_effect == "Breathe" {
+            if self.is_music_running() {
+                self.start_music();
+            } else if self.selected_effect == "Solid" || self.selected_effect == "Breathe" {
                 self.dispatch_current_effect();
             }
         }
@@ -933,22 +1120,130 @@ impl eframe::App for AulaF75App {
 
             ui.add_space(12.0);
 
+            // Music Mode (Audio Reactive Lighting)
+            ui.heading("Audio Reactive Lighting (Music Mode)");
+            ui.add_space(8.0);
+
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Reactive Mode:");
+                    let current_mode_str = match self.music_mode {
+                        MusicMode::Bars => "Bars (Spectrum across keys)",
+                        MusicMode::Pulse => "Pulse (Whole-board beat)",
+                    };
+                    egui::ComboBox::from_label("##music_mode_select")
+                        .selected_text(current_mode_str)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_value(
+                                    &mut self.music_mode,
+                                    MusicMode::Bars,
+                                    "Bars (Spectrum across keys)",
+                                )
+                                .clicked()
+                                && self.is_music_running()
+                            {
+                                self.start_music();
+                            }
+                            if ui
+                                .selectable_value(
+                                    &mut self.music_mode,
+                                    MusicMode::Pulse,
+                                    "Pulse (Whole-board beat)",
+                                )
+                                .clicked()
+                                && self.is_music_running()
+                            {
+                                self.start_music();
+                            }
+                        });
+                });
+
+                ui.add_space(6.0);
+
+                // Base Color Picker (reused)
+                ui.horizontal(|ui| {
+                    ui.label("Base Color:");
+                    let mut srgb = self.color_rgb;
+                    if ui.color_edit_button_srgb(&mut srgb).changed() {
+                        self.set_color_from_picker(srgb);
+                    }
+                });
+
+                ui.add_space(6.0);
+
+                // Audio Gain Slider
+                ui.horizontal(|ui| {
+                    ui.label("Audio Gain:");
+                    let gain_label = format!("{:.1}x", self.music_gain);
+                    if ui
+                        .add(egui::Slider::new(&mut self.music_gain, 0.1..=5.0).text(gain_label))
+                        .changed()
+                        && self.is_music_running()
+                    {
+                        self.start_music();
+                    }
+                });
+
+                ui.add_space(8.0);
+
+                // Start / Stop Music button
+                ui.horizontal(|ui| {
+                    if self.is_music_running() {
+                        if ui.button("⏹ Stop Music").clicked() {
+                            self.on_off_clicked();
+                        }
+                    } else if ui.button("▶ Start Music").clicked() {
+                        self.start_music();
+                    }
+                });
+
+                ui.add_space(8.0);
+
+                // Level meter (ProgressBar from last band energies via channel)
+                let avg_level = if self.last_music_bands.is_empty() {
+                    0.0
+                } else {
+                    let sum: f32 = self.last_music_bands.iter().sum();
+                    (sum / self.last_music_bands.len() as f32).clamp(0.0, 1.0)
+                };
+
+                ui.horizontal(|ui| {
+                    ui.label("Audio Level:");
+                    ui.add(
+                        egui::ProgressBar::new(avg_level)
+                            .text(format!("{:.0}%", avg_level * 100.0))
+                            .animate(self.is_music_running()),
+                    );
+                });
+            });
+
+            ui.add_space(12.0);
+
             // Status footer
             ui.group(|ui| {
                 let tick_rate_label = if self.is_worker_running() {
-                    match self.selected_effect.to_ascii_lowercase().as_str() {
-                        "solid" => "~1.5 Hz (keepalive)",
-                        "off" => "0 Hz (stopped)",
-                        _ => "~25 Hz (active stream)",
+                    if self.is_music_running() {
+                        "~20 Hz (audio stream)"
+                    } else {
+                        match self.selected_effect.to_ascii_lowercase().as_str() {
+                            "solid" => "~1.5 Hz (keepalive)",
+                            "off" => "0 Hz (stopped)",
+                            _ => "~25 Hz (active stream)",
+                        }
                     }
                 } else {
                     "0 Hz (idle)"
                 };
 
                 let active_name = if self.is_worker_running() {
-                    &self.selected_effect
+                    if self.is_music_running() {
+                        format!("Music ({})", self.music_mode)
+                    } else {
+                        self.selected_effect.clone()
+                    }
                 } else {
-                    "None"
+                    "None".to_string()
                 };
 
                 ui.label(format!(
@@ -960,7 +1255,9 @@ impl eframe::App for AulaF75App {
 
         // Request repaint depending on streaming state
         if self.is_worker_running() {
-            let repaint_interval = if self.selected_effect == "Solid" {
+            let repaint_interval = if self.is_music_running() {
+                Duration::from_millis(40)
+            } else if self.selected_effect == "Solid" {
                 Duration::from_millis(200)
             } else {
                 Duration::from_millis(40)

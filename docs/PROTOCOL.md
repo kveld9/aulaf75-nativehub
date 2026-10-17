@@ -85,6 +85,18 @@ To replicate vendor onboard lighting effects without touching dangerous or unver
 - **Refresh Rates**: Dynamic effects stream at ~25 Hz (`Duration::from_millis(40)` or tick frequency `25.0 Hz`) to achieve smooth perceptual color transitions; static `solid` mode streams at ~1.5 Hz (`KEEPALIVE_HZ`) to maintain the hardware keepalive latch.
 - **Safety Invariant**: All host effects stream strictly on verified Report 6. Blind writes to Report 5 or non-verified configuration mailboxes remain strictly prohibited.
 
+### 3.3 System-Audio Reactive Lighting (Music Mode)
+
+Music mode renders dynamic audio-reactive lighting directly on the host CPU and streams Report 6 frames without vendor software or firmware modifications:
+
+- **Host Loop & Frame Rate**: Sliding audio analysis and frame transmission run at ~20 fps (`Duration::from_millis(50)`). This refresh rate provides responsive visual beat synchronization while remaining comfortably within the hidraw throughput bounds verified on interface 1.
+- **Audio Capture Transport**: Captures standard PulseAudio/PipeWire monitor streams using a child `parec` process (`s16le`, 44.1 kHz, stereo). The stream is mixed to mono `f32` in real time with an adjustable input gain.
+- **FFT & Spectrum Analysis**: 1024-point radix-2 Cooley-Tukey FFT with precomputed bit-reversal and inline Hann windowing. Log-spaced energy bands (40 Hz to 12 kHz) are computed and normalized dynamically using a decaying peak tracker (`AutoGain`).
+- **Matrix Mapping**:
+  - `Bars`: Frequency band energies map horizontally across the physical 80-key layout following `KEY_SLOTS` order (`slot_i = band[i * nbands / nslots]`).
+  - `Pulse`: Whole-board base color is scaled proportionally to average audio volume.
+- **Safety Invariant**: Transmitted strictly on the verified Report 6 path (`06 08 00 00 01 00 7A 01` header). Report 5 remains prohibited.
+
 ---
 
 ## 4. Credits

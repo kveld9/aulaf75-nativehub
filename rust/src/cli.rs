@@ -16,6 +16,11 @@ pub mod profile;
 
 pub use profile::Profile;
 
+#[path = "music.rs"]
+pub mod music;
+
+pub use music::{AudioConfig, MusicMode};
+
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
 extern "C" fn sigint_handler(_: libc::c_int) {
@@ -153,6 +158,21 @@ pub enum Commands {
     Profile {
         #[command(subcommand)]
         action: ProfileCommands,
+    },
+    /// Stream music-reactive lighting based on system audio
+    Music {
+        /// Reactive lighting mode (bars, pulse)
+        #[arg(long, default_value = "bars")]
+        mode: String,
+        /// Hex color string (e.g. '00ffff', '#ff00aa')
+        #[arg(long, default_value = "00ffff")]
+        color: String,
+        /// Audio gain multiplier (default: 1.0)
+        #[arg(long, default_value_t = 1.0)]
+        gain: f32,
+        /// Duration to run music mode in seconds (0 or omitted = run until Ctrl+C)
+        #[arg(long)]
+        seconds: Option<f64>,
     },
 }
 
@@ -424,6 +444,90 @@ pub fn run_effect_lighting(
     }
 }
 
+/// Stream system-audio reactive lighting.
+pub fn run_music_lighting(
+    mode: music::MusicMode,
+    color: (u8, u8, u8),
+    gain: f32,
+    seconds: Option<f64>,
+) -> i32 {
+    let node = match device::resolve_control_node() {
+        Some(p) => p,
+        None => {
+            eprintln!("Error: AULA F75 interface 1 control node not found.");
+            eprintln!("Ensure keyboard is connected via USB and udev rule 99-aula-f75.rules is installed.");
+            return 1;
+        }
+    };
+
+    let file = match OpenOptions::new().read(true).write(true).open(&node) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error opening control node {}: {}", node.display(), e);
+            eprintln!("Check permissions or install udev rule: sudo cp 99-aula-f75.rules /etc/udev/rules.d/");
+            return 1;
+        }
+    };
+
+    let child = match music::spawn_monitor() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error initializing audio capture: {}", e);
+            return 1;
+        }
+    };
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut guard = ChildGuard(child);
+
+    let mut stdout = match guard.0.stdout.take() {
+        Some(s) => s,
+        None => {
+            eprintln!("Error: Failed to capture stdout pipe from parec process");
+            return 1;
+        }
+    };
+
+    install_sigint_handler();
+    let fd = file.as_raw_fd();
+
+    println!(
+        "Streaming music-reactive lighting (mode: {}, color: #{:02x}{:02x}{:02x}, gain: {:.2}) on {}...",
+        mode, color.0, color.1, color.2, gain, node.display()
+    );
+    println!("Press Ctrl+C to stop.");
+
+    let res = music::run_music_loop(
+        &mut stdout,
+        |frame| {
+            device::send_with_retry(
+                || proto::hid_set_feature(fd, frame),
+                5,
+                || std::thread::sleep(Duration::from_millis(5)),
+            )
+        },
+        mode,
+        color,
+        gain,
+        seconds,
+        is_running,
+    );
+
+    match res {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("Device communication error during music mode: {}", e);
+            1
+        }
+    }
+}
+
 /// Execute CLI commands and return exit code.
 pub fn run() -> i32 {
     let cli = Cli::parse();
@@ -532,6 +636,29 @@ pub fn run() -> i32 {
         }
         Commands::Effects => cmd_effects(),
         Commands::Profile { action } => cmd_profile(&action),
+        Commands::Music {
+            mode,
+            color,
+            gain,
+            seconds,
+        } => {
+            let parsed_mode = match mode.parse::<music::MusicMode>() {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    return 2;
+                }
+            };
+            let parsed_color = match parse_color_hex(&color) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error parsing hex color: {}", e);
+                    return 2;
+                }
+            };
+            let clamped_gain = gain.max(0.01);
+            run_music_lighting(parsed_mode, parsed_color, clamped_gain, seconds)
+        }
     }
 }
 
@@ -913,6 +1040,56 @@ mod tests {
                 assert_eq!(name, "gaming");
             }
             _ => panic!("Expected Commands::Profile::Show"),
+        }
+    }
+
+    #[test]
+    fn test_cli_subcommand_music_parse() {
+        // Default music command
+        let parsed_default = Cli::try_parse_from(["aula-f75-rs", "music"]);
+        assert!(parsed_default.is_ok());
+        match parsed_default.unwrap().command {
+            Commands::Music {
+                mode,
+                color,
+                gain,
+                seconds,
+            } => {
+                assert_eq!(mode, "bars");
+                assert_eq!(color, "00ffff");
+                assert_eq!(gain, 1.0);
+                assert_eq!(seconds, None);
+            }
+            _ => panic!("Expected Commands::Music"),
+        }
+
+        // Custom parameters
+        let parsed_custom = Cli::try_parse_from([
+            "aula-f75-rs",
+            "music",
+            "--mode",
+            "pulse",
+            "--color",
+            "ff0055",
+            "--gain",
+            "2.5",
+            "--seconds",
+            "10.0",
+        ]);
+        assert!(parsed_custom.is_ok());
+        match parsed_custom.unwrap().command {
+            Commands::Music {
+                mode,
+                color,
+                gain,
+                seconds,
+            } => {
+                assert_eq!(mode, "pulse");
+                assert_eq!(color, "ff0055");
+                assert_eq!(gain, 2.5);
+                assert_eq!(seconds, Some(10.0));
+            }
+            _ => panic!("Expected Commands::Music"),
         }
     }
 }

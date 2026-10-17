@@ -13,6 +13,7 @@ The AULA F75 keyboard exposes USB HID interfaces (typical VID `258a`, PID `010c`
 - **Tranche 5**: Per-key LED map for the AULA F75 (80 mapped key slots) and `key`/`keys` CLI subcommands.
 - **Tranche 6**: Host-rendered RGB lighting effects engine (`rainbow`, `wave`, `breathe`, `stars`, `solid`, `off`) and presentable desktop GUI panel.
 - **Tranche 7**: Local lighting profiles (`save`, `load`, `list`, `delete`, `show`) for effects, colors, brightness, and per-key overrides with XDG flat file persistence and desktop GUI integration.
+- **Tranche 8**: System-audio reactive lighting (music mode) with real-time Cooley-Tukey FFT, log-spaced frequency bands, AutoGain, and host-rendered Report 6 direct frames across CLI and GUI.
 
 ## Non-Goals & Safety Rules
 
@@ -266,6 +267,41 @@ aula-f75-rs profile show NAME
 # Delete profile
 aula-f75-rs profile delete NAME
 ```
+
+## System Audio Reactive Lighting (Tranche 8)
+
+Tranche 8 provides host-driven, audio-reactive RGB lighting (`music` mode) powered by the Linux audio stack without adding external native C/C++ audio library dependencies.
+
+### Architecture & Design
+
+- **Audio Capture**: Spawns `parec` on the default output sink monitor (`pactl get-default-sink` + `.monitor`) using 44.1 kHz 16-bit little-endian stereo PCM (`s16le`).
+- **Signal Processing**: Hand-rolled radix-2 Cooley-Tukey FFT implemented purely in Rust standard library with inline Hann windowing and precomputed twiddle factor tables.
+- **Spectrum & AutoGain**: Analyzes log-spaced frequency bands (40 Hz to 12 kHz) with an exponential decaying peak tracker (`AutoGain`) to automatically adjust sensitivity to audio volume.
+- **Hardware Rendering**: Maps normalized frequency band energies to Report 6 direct RGB frames streamed at ~20 fps.
+
+### Requirements
+
+- A Linux audio server with `pulseaudio-utils` or `pipewire-pulse` providing `parec` and `pactl`.
+- Keyboard toggled into its onboard **Custom / Static RGB** mode (via onboard Fn shortcuts).
+
+### CLI Usage
+
+```bash
+# Run bars mode (frequency spectrum mapped across physical keys) with default cyan color
+aula-f75-rs music
+
+# Run pulse mode (whole-board beat pulse) with magenta color and 2.0x gain for 10 seconds
+aula-f75-rs music --mode pulse --color ff00aa --gain 2.0 --seconds 10
+```
+
+### GUI Integration
+
+The native desktop GUI (`aula-f75-gui`) includes a dedicated **Audio Reactive Lighting (Music Mode)** panel:
+- **Mode Dropdown**: Toggle between `Bars` (column spectrum) and `Pulse` (whole-board volume pulse).
+- **Color Picker**: Dynamic color selection for the reactive base lighting.
+- **Audio Gain Slider**: Real-time gain multiplier adjustment (`0.1x` to `5.0x`).
+- **Level Meter**: Real-time visual audio energy level `ProgressBar` streamed via non-blocking channels from the worker thread.
+- **Non-blocking Worker**: Audio capture and FFT analysis execute entirely on the background worker thread, ensuring the UI stays responsive.
 
 ### Verification Gate
 
