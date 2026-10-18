@@ -1,0 +1,2 @@
+rust/Cargo.lock linguist-vendored=true
+*.md linguist-documentation=true

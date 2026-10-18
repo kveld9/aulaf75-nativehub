@@ -1,5 +1,6 @@
 [Unit]
 Description=AULA F75 RGB Lighting Service
+Documentation=https://github.com/kveld9/aulaf75-nativehub
 After=default.target
 
 [Service]
