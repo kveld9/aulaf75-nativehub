@@ -13,6 +13,9 @@ use crate::cli::profile;
 use crate::effects::Effect;
 use crate::gui::panels;
 use crate::gui::reconnect::{run_worker_reconnect_loop, run_worker_thread};
+use crate::gui::service::{
+    restore_after_gui, suspend_for_gui, FakeServiceRunner, ServiceRunner, SystemdServiceRunner,
+};
 use crate::gui::theme::{
     app_visuals, configure_app_style, corner_radius, COLOR_BG_INPUT, COLOR_BORDER_SUBTLE,
     COLOR_TEXT_MUTED, COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY,
@@ -141,6 +144,11 @@ pub struct AulaF75App {
     pub status_rx: Option<Receiver<WorkerStatus>>,
     /// Background worker thread handle.
     pub worker_handle: Option<JoinHandle<()>>,
+
+    /// Background service runner for single-writer coordination.
+    pub service_runner: Option<Box<dyn ServiceRunner>>,
+    /// Whether the background service was active before GUI takeover.
+    pub service_was_active: bool,
 }
 
 impl Default for AulaF75App {
@@ -175,16 +183,21 @@ impl Default for AulaF75App {
             worker_tx: None,
             status_rx: None,
             worker_handle: None,
+            service_runner: None,
+            service_was_active: false,
         }
     }
 }
 
 impl AulaF75App {
-    /// Create a new instance for eframe initialization and spawn worker in connect-only mode.
+    /// Create a new instance for eframe initialization, park systemd service, and spawn worker in connect-only mode.
     pub fn new(cc: &eframe::CreationContext) -> Self {
         cc.egui_ctx.set_visuals(app_visuals());
         cc.egui_ctx.style_mut(configure_app_style);
         let mut app = Self::default();
+        let mut runner = Box::new(SystemdServiceRunner::default());
+        app.service_was_active = suspend_for_gui(runner.as_mut());
+        app.service_runner = Some(runner);
         app.start_worker(None);
         app
     }
@@ -205,6 +218,9 @@ impl AulaF75App {
         D: Send + 'static,
     {
         let mut app = Self::default();
+        let mut runner = Box::new(FakeServiceRunner::default());
+        app.service_was_active = suspend_for_gui(runner.as_mut());
+        app.service_runner = Some(runner);
         app.start_worker_with(
             None,
             reconnect_interval,
@@ -214,6 +230,26 @@ impl AulaF75App {
             sleep_fn,
         );
         app
+    }
+
+    /// Create a test instance with an injectable service runner without spawning worker threads.
+    pub fn new_with_service_runner<SR: ServiceRunner + 'static>(mut runner: SR) -> Self {
+        let mut app = Self::default();
+        app.service_was_active = suspend_for_gui(&mut runner);
+        app.service_runner = Some(Box::new(runner));
+        app
+    }
+
+    /// Restore the background service if it was suspended when the GUI opened.
+    ///
+    /// Ensures restore is executed at most once.
+    pub fn restore_service(&mut self) {
+        if self.service_was_active {
+            if let Some(ref mut runner) = self.service_runner {
+                restore_after_gui(runner.as_mut(), true);
+            }
+            self.service_was_active = false;
+        }
     }
 
     /// Check if the streaming worker thread is active.
@@ -468,6 +504,7 @@ impl AulaF75App {
 impl Drop for AulaF75App {
     fn drop(&mut self) {
         self.stop_worker();
+        self.restore_service();
     }
 }
 
@@ -522,5 +559,84 @@ impl eframe::App for AulaF75App {
         } else if self.is_worker_running() {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gui::service::FakeServiceRunner;
+
+    #[test]
+    fn test_app_lifecycle_suspends_and_restores_active_service() {
+        let fake = FakeServiceRunner::new(true);
+        let app = AulaF75App::new_with_service_runner(fake.clone());
+
+        assert_eq!(fake.check_active_count(), 1);
+        assert_eq!(fake.stop_count(), 1);
+        assert!(app.service_was_active);
+        assert!(!fake.is_active());
+
+        drop(app);
+
+        assert_eq!(fake.start_count(), 1);
+        assert!(fake.is_active());
+    }
+
+    #[test]
+    fn test_app_lifecycle_no_stop_when_inactive() {
+        let fake = FakeServiceRunner::new(false);
+        let app = AulaF75App::new_with_service_runner(fake.clone());
+
+        assert_eq!(fake.check_active_count(), 1);
+        assert_eq!(fake.stop_count(), 0);
+        assert!(!app.service_was_active);
+
+        drop(app);
+
+        assert_eq!(fake.start_count(), 0);
+    }
+
+    #[test]
+    fn test_app_restore_service_executed_only_once() {
+        let fake = FakeServiceRunner::new(true);
+        let mut app = AulaF75App::new_with_service_runner(fake.clone());
+
+        assert_eq!(fake.stop_count(), 1);
+        assert!(app.service_was_active);
+
+        app.restore_service();
+        assert_eq!(fake.start_count(), 1);
+        assert!(!app.service_was_active);
+
+        // Subsequent call must be a no-op
+        app.restore_service();
+        assert_eq!(fake.start_count(), 1);
+
+        // Drop must not re-trigger restore
+        drop(app);
+        assert_eq!(fake.start_count(), 1);
+    }
+
+    #[test]
+    fn test_app_swallows_panicking_service_runner() {
+        let fake = FakeServiceRunner::new(true).with_panic();
+        let app = AulaF75App::new_with_service_runner(fake);
+        // Suspension panic was swallowed
+        assert!(!app.service_was_active);
+        // Drop must not panic
+        drop(app);
+    }
+
+    #[test]
+    fn test_app_new_with_runner_uses_fake_service() {
+        let app = AulaF75App::new_with_runner(
+            Duration::from_millis(10),
+            || None,
+            |_| Ok(()),
+            |_, _| Ok(()),
+            |_| {},
+        );
+        assert!(!app.service_was_active);
     }
 }

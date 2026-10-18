@@ -7,12 +7,17 @@
 
 pub mod panels;
 pub mod reconnect;
+pub mod service;
 pub mod state;
 pub mod theme;
 pub mod worker;
 
 pub use crate::cli::parse_color_hex;
 pub use reconnect::run_worker_reconnect_loop;
+pub use service::{
+    restore_after_gui, suspend_for_gui, ClosureServiceRunner, FakeServiceRunner, NoopServiceRunner,
+    ServiceRunner, SystemdServiceRunner, DEFAULT_SERVICE_NAME, DEFAULT_SYSTEMCTL_TIMEOUT,
+};
 pub use state::{AulaF75App, GuiLightingMode, GuiState};
 pub use theme::{
     app_visuals, card_frame, compute_preview_rgb, configure_app_style, corner_radius,

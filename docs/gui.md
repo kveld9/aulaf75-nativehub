@@ -79,6 +79,12 @@ Integrated management interface for persistent presets:
 ### Status Footer Bar
 Persistent bottom bar reporting active stream name, estimated tick rate, and hardware communication status.
 
+### Systemd Service Coordination (Single-Writer Rule)
+- **Automatic Service Parking**: To prevent flicker between two concurrent writers and enforce the single-writer rule on the `/dev/hidraw*` control node, `aula-f75-gui` automatically parks the background systemd user service (`aula-f75.service`) while open.
+- **Automatic Restoration**: When the GUI is closed, the application restores `aula-f75.service` on exit if it was active prior to launch.
+- **Single-Writer Rule**: Only one writer should control the keyboard's direct RGB interface at any given time. While the GUI runs, it owns the device control node exclusively.
+- **Persistent Lighting After Exit**: Direct RGB streaming stops when the GUI window is closed. To maintain a static color or lighting preset after closing the GUI, set the service unit's `ExecStart` directive to that desired `solid` color or `profile load` preset.
+
 ---
 
 ## Troubleshooting
