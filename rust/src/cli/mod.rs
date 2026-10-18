@@ -241,6 +241,13 @@ pub enum ProfileCommands {
         /// Profile name
         name: String,
     },
+    /// Set a saved profile as the default startup profile
+    SetDefault {
+        /// Profile name
+        name: String,
+    },
+    /// Clear the default startup profile marker
+    ClearDefault,
 }
 
 fn parse_optional_filter(val: Option<String>, flag_name: &str) -> Result<Option<u16>, ()> {

@@ -16,13 +16,14 @@ impl AulaF75App {
         match profile::list_profiles(None) {
             Ok(list) => {
                 self.saved_profiles = list;
-                if let Some(ref sel) = self.selected_profile {
-                    if !self.saved_profiles.contains(sel) {
-                        self.selected_profile = self.saved_profiles.first().cloned();
-                    }
-                } else {
-                    self.selected_profile = self.saved_profiles.first().cloned();
-                }
+                let valid_selection = self
+                    .selected_profile
+                    .as_ref()
+                    .filter(|sel| self.saved_profiles.contains(sel))
+                    .cloned();
+                self.selected_profile = valid_selection.or_else(|| {
+                    AulaF75App::resolve_startup_profile(&self.saved_profiles, None)
+                });
             }
             Err(e) => {
                 self.profile_status = Some(format!("Error listing profiles: {}", e));
@@ -162,6 +163,138 @@ impl AulaF75App {
             }
         }
     }
+
+    /// Set the currently selected profile as the default startup profile.
+    pub fn on_set_default_clicked(&mut self) {
+        let sel = match self.selected_profile.clone() {
+            Some(s) => s,
+            None => {
+                self.profile_status =
+                    Some("Error: No profile selected to set as default".to_string());
+                return;
+            }
+        };
+
+        match profile::set_default_profile(&sel, None) {
+            Ok(()) => {
+                let msg = format!("Profile '{}' set as default", sel);
+                self.status_text = msg.clone();
+                self.profile_status = Some(msg);
+            }
+            Err(e) => {
+                self.profile_status = Some(format!("Error setting default profile: {}", e));
+            }
+        }
+    }
+
+    /// Clear the default startup profile marker.
+    pub fn on_clear_default_clicked(&mut self) {
+        match profile::clear_default_profile(None) {
+            Ok(()) => {
+                let msg = "Default profile cleared".to_string();
+                self.status_text = msg.clone();
+                self.profile_status = Some(msg);
+            }
+            Err(e) => {
+                self.profile_status = Some(format!("Error clearing default profile: {}", e));
+            }
+        }
+    }
+}
+
+fn render_profile_selection_row(app: &mut AulaF75App, ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Saved profiles:")
+                .size(12.0)
+                .color(COLOR_TEXT_SECONDARY),
+        );
+        let default_name = profile::get_default_profile(None);
+        let current_selection = match &app.selected_profile {
+            Some(p) => {
+                if default_name.as_deref() == Some(p.as_str()) {
+                    format!("{} (default)", p)
+                } else {
+                    p.clone()
+                }
+            }
+            None => "No profiles saved".to_string(),
+        };
+
+        egui::ComboBox::from_label("##profile_combo")
+            .selected_text(&current_selection)
+            .show_ui(ui, |ui| {
+                for p in &app.saved_profiles {
+                    let label = if default_name.as_deref() == Some(p.as_str()) {
+                        format!("{} (default)", p)
+                    } else {
+                        p.clone()
+                    };
+                    ui.selectable_value(
+                        &mut app.selected_profile,
+                        Some(p.clone()),
+                        label,
+                    );
+                }
+            });
+
+        if ui.button(RichText::new("Apply").strong()).clicked() {
+            app.on_apply_profile_clicked();
+        }
+
+        if ui
+            .button(RichText::new("Delete").color(COLOR_STATUS_ERROR))
+            .clicked()
+        {
+            app.on_delete_profile_clicked();
+        }
+
+        let is_default = app.selected_profile.as_ref() == default_name.as_ref()
+            && app.selected_profile.is_some();
+
+        if is_default {
+            if ui.button("Clear default").clicked() {
+                app.on_clear_default_clicked();
+            }
+        } else {
+            if app.selected_profile.is_some() {
+                if ui.button("Set as default").clicked() {
+                    app.on_set_default_clicked();
+                }
+            }
+            if default_name.is_some() {
+                if ui.button("Clear default").clicked() {
+                    app.on_clear_default_clicked();
+                }
+            }
+        }
+    });
+}
+
+fn render_profile_save_row(app: &mut AulaF75App, ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Save current as:")
+                .size(12.0)
+                .color(COLOR_TEXT_SECONDARY),
+        );
+        ui.text_edit_singleline(&mut app.profile_name_input);
+        if ui.button("Save Profile").clicked() {
+            app.save_current_profile();
+        }
+    });
+}
+
+fn render_profile_status(app: &AulaF75App, ui: &mut egui::Ui) {
+    if let Some(ref status) = app.profile_status {
+        ui.add_space(4.0);
+        let color = if status.starts_with("Error") {
+            COLOR_STATUS_ERROR
+        } else {
+            COLOR_STATUS_STREAMING
+        };
+        ui.colored_label(color, status);
+    }
 }
 
 /// Render the lighting profiles management panel.
@@ -175,68 +308,14 @@ pub fn render_profiles_panel(app: &mut AulaF75App, ui: &mut egui::Ui) {
     ui.add_space(6.0);
 
     card_frame().show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Saved profiles:")
-                    .size(12.0)
-                    .color(COLOR_TEXT_SECONDARY),
-            );
-            let current_selection = app
-                .selected_profile
-                .as_deref()
-                .unwrap_or("No profiles saved");
-
-            egui::ComboBox::from_label("##profile_combo")
-                .selected_text(current_selection)
-                .show_ui(ui, |ui| {
-                    for p in &app.saved_profiles {
-                        ui.selectable_value(
-                            &mut app.selected_profile,
-                            Some(p.clone()),
-                            p,
-                        );
-                    }
-                });
-
-            if ui.button(RichText::new("Apply").strong()).clicked() {
-                app.on_apply_profile_clicked();
-            }
-
-            if ui
-                .button(RichText::new("Delete").color(COLOR_STATUS_ERROR))
-                .clicked()
-            {
-                app.on_delete_profile_clicked();
-            }
-        });
-
+        render_profile_selection_row(app, ui);
         ui.add_space(8.0);
-
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Save current as:")
-                    .size(12.0)
-                    .color(COLOR_TEXT_SECONDARY),
-            );
-            ui.text_edit_singleline(&mut app.profile_name_input);
-            if ui.button("Save Profile").clicked() {
-                app.save_current_profile();
-            }
-        });
-
-        if let Some(ref status) = app.profile_status {
-            ui.add_space(4.0);
-            let color = if status.starts_with("Error") {
-                COLOR_STATUS_ERROR
-            } else {
-                COLOR_STATUS_STREAMING
-            };
-            ui.colored_label(color, status);
-        }
+        render_profile_save_row(app, ui);
+        render_profile_status(app, ui);
     });
 }
 
-fn resolve_profile_effect_name(effect: &str) -> &'static str {
+pub(crate) fn resolve_profile_effect_name(effect: &str) -> &'static str {
     match effect.to_ascii_lowercase().as_str() {
         "solid" => "Solid",
         "rainbow" => "Rainbow",

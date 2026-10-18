@@ -177,15 +177,71 @@ pub struct AulaF75App {
     pub custom_service_unit_path: Option<PathBuf>,
 }
 
+/// Pure helper resolving startup profile selection from saved profiles and default marker.
+///
+/// Priority:
+/// 1. Default marker profile if present and contained in `saved`
+/// 2. First alphabetical entry in `saved`
+/// 3. None if `saved` is empty
+pub fn resolve_startup_profile(
+    saved: &[String],
+    base_dir: Option<&std::path::Path>,
+) -> Option<String> {
+    if let Some(default_name) = profile::get_default_profile(base_dir) {
+        if saved.contains(&default_name) {
+            return Some(default_name);
+        }
+    }
+    saved.first().cloned()
+}
+
+/// Pure helper returning the initial WorkerMessage for a given Profile.
+///
+/// - Key profiles return `WorkerMessage::SetKeyFrame(keys)`
+/// - Effect profiles return the corresponding WorkerMessage (SetEffect or Off)
+pub fn initial_worker_message_for_profile(prof: &profile::Profile) -> WorkerMessage {
+    if !prof.keys.is_empty() {
+        WorkerMessage::SetKeyFrame(prof.keys.clone())
+    } else {
+        let eff_name = panels::profiles::resolve_profile_effect_name(&prof.effect);
+        if eff_name == "Off" {
+            WorkerMessage::Off
+        } else {
+            let rgb_opt = prof.color.map(|c| crate::effects::RGB(c.0, c.1, c.2));
+            let effect = crate::effects::Effect::from_name_with_speed(
+                &prof.effect.trim().to_ascii_lowercase(),
+                rgb_opt,
+                prof.speed,
+            )
+            .unwrap_or(crate::effects::Effect::Solid(crate::effects::RGB(255, 0, 0)));
+            WorkerMessage::SetEffect {
+                effect,
+                brightness: prof.brightness,
+            }
+        }
+    }
+}
+
+/// Pure helper resolving the initial WorkerMessage for the configured default profile, if any.
+pub fn resolve_initial_worker_message(base_dir: Option<&std::path::Path>) -> Option<WorkerMessage> {
+    let default_name = profile::get_default_profile(base_dir)?;
+    let prof = profile::load_profile(&default_name, base_dir).ok()?;
+    Some(initial_worker_message_for_profile(&prof))
+}
+
 impl Default for AulaF75App {
     fn default() -> Self {
         let initial_rgb = [255, 0, 0];
         let initial_hex = "FF0000".to_string();
 
         let saved = profile::list_profiles(None).unwrap_or_default();
-        let initial_selected = saved.first().cloned();
+        let initial_selected = resolve_startup_profile(&saved, None);
+        let default_name = profile::get_default_profile(None);
+        let default_prof = default_name
+            .as_deref()
+            .and_then(|n| profile::load_profile(n, None).ok());
 
-        Self {
+        let mut app = Self {
             state: GuiState {
                 mode: GuiLightingMode::Off,
                 rgb: (initial_rgb[0], initial_rgb[1], initial_rgb[2]),
@@ -216,11 +272,61 @@ impl Default for AulaF75App {
             streamed: false,
             last_was_keyframe: false,
             custom_service_unit_path: None,
+        };
+
+        if let Some(ref prof) = default_prof {
+            app.apply_default_profile_visuals(prof);
         }
+
+        app
     }
 }
 
 impl AulaF75App {
+    /// Resolve startup profile selection from saved profiles and default marker.
+    pub fn resolve_startup_profile(
+        saved: &[String],
+        base_dir: Option<&std::path::Path>,
+    ) -> Option<String> {
+        resolve_startup_profile(saved, base_dir)
+    }
+
+    /// Return the initial WorkerMessage corresponding to the default profile, if one is configured and valid.
+    pub fn initial_worker_message(&self) -> Option<WorkerMessage> {
+        resolve_initial_worker_message(None)
+    }
+
+    /// Apply default profile visual and state properties without spawning worker threads.
+    pub fn apply_default_profile_visuals(&mut self, prof: &profile::Profile) {
+        self.brightness = prof.brightness;
+        self.effect_speed = prof.speed;
+        self.streamed = true;
+        self.state.streamed = true;
+
+        if !prof.keys.is_empty() {
+            self.last_was_keyframe = true;
+            self.state.last_was_keyframe = true;
+            self.state.mode = GuiLightingMode::Off;
+        } else {
+            self.last_was_keyframe = false;
+            self.state.last_was_keyframe = false;
+            self.selected_effect =
+                panels::profiles::resolve_profile_effect_name(&prof.effect).to_string();
+            if let Some(c) = prof.color {
+                self.color_rgb = [c.0, c.1, c.2];
+                self.hex_input = format!("{:02X}{:02X}{:02X}", c.0, c.1, c.2);
+                self.hex_error = None;
+                self.state.rgb = (c.0, c.1, c.2);
+            }
+            let effect = self.current_effect();
+            if effect == Effect::Off {
+                self.state.mode = GuiLightingMode::Off;
+            } else {
+                self.state.mode = GuiLightingMode::Effect(effect);
+            }
+        }
+    }
+
     /// Create a new instance for eframe initialization, park systemd service, and spawn worker in connect-only mode.
     pub fn new(cc: &eframe::CreationContext) -> Self {
         cc.egui_ctx.set_visuals(app_visuals());
@@ -229,7 +335,8 @@ impl AulaF75App {
         let mut runner = Box::new(SystemdServiceRunner::default());
         app.service_was_active = suspend_for_gui(runner.as_mut());
         app.service_runner = Some(runner);
-        app.start_worker(None);
+        let initial_cmd = app.initial_worker_message();
+        app.start_worker(initial_cmd);
         app
     }
 
@@ -252,8 +359,9 @@ impl AulaF75App {
         let mut runner = Box::new(FakeServiceRunner::default());
         app.service_was_active = suspend_for_gui(runner.as_mut());
         app.service_runner = Some(runner);
+        let initial_cmd = app.initial_worker_message();
         app.start_worker_with(
-            None,
+            initial_cmd,
             reconnect_interval,
             resolve_fn,
             open_fn,

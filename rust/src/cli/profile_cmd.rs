@@ -146,9 +146,14 @@ fn handle_list_profiles() -> i32 {
             if list.is_empty() {
                 println!("No profiles found.");
             } else {
+                let default_prof = profile::get_default_profile(None);
                 println!("Saved profiles ({}):", list.len());
                 for name in list {
-                    println!("  {}", name);
+                    if default_prof.as_deref() == Some(&name) {
+                        println!("  {} (default)", name);
+                    } else {
+                        println!("  {}", name);
+                    }
                 }
             }
             0
@@ -185,7 +190,12 @@ fn print_profile_keys(keys: &[(String, (u8, u8, u8))]) {
 fn handle_show_profile(name: &str) -> i32 {
     match profile::load_profile(name, None) {
         Ok(prof) => {
-            println!("Profile: {}", prof.name);
+            let is_default = profile::get_default_profile(None).as_deref() == Some(&prof.name);
+            if is_default {
+                println!("Profile: {} (default)", prof.name);
+            } else {
+                println!("Profile: {}", prof.name);
+            }
             println!("  Effect: {}", prof.effect);
             if let Some(c) = prof.color {
                 println!("  Color: #{:02X}{:02X}{:02X}", c.0, c.1, c.2);
@@ -196,6 +206,32 @@ fn handle_show_profile(name: &str) -> i32 {
         }
         Err(e) => {
             eprintln!("Error showing profile: {}", e);
+            1
+        }
+    }
+}
+
+fn handle_set_default_profile(name: &str) -> i32 {
+    match profile::set_default_profile(name, None) {
+        Ok(()) => {
+            println!("Profile '{}' set as default.", name.trim());
+            0
+        }
+        Err(e) => {
+            eprintln!("Error setting default profile: {}", e);
+            1
+        }
+    }
+}
+
+fn handle_clear_default_profile() -> i32 {
+    match profile::clear_default_profile(None) {
+        Ok(()) => {
+            println!("Default profile cleared.");
+            0
+        }
+        Err(e) => {
+            eprintln!("Error clearing default profile: {}", e);
             1
         }
     }
@@ -215,5 +251,7 @@ pub fn cmd_profile(action: &ProfileCommands) -> i32 {
         ProfileCommands::List => handle_list_profiles(),
         ProfileCommands::Delete { name } => handle_delete_profile(name),
         ProfileCommands::Show { name } => handle_show_profile(name),
+        ProfileCommands::SetDefault { name } => handle_set_default_profile(name),
+        ProfileCommands::ClearDefault => handle_clear_default_profile(),
     }
 }

@@ -19,7 +19,7 @@ The CLI provides 13 subcommands across hardware inspection, lighting control, pr
 | `keys` | List all 80 supported physical key names and frame slot numbers |
 | `fx` | Stream dynamic host-rendered effects with color, brightness, and speed control |
 | `effects` | List all available host-rendered RGB lighting effects |
-| `profile` | Manage local lighting profiles (`save`, `load`, `list`, `delete`, `show`) |
+| `profile` | Manage local lighting profiles (`save`, `load`, `list`, `delete`, `show`, `set-default`, `clear-default`) |
 | `music` | Stream system audio-reactive frequency spectrum and beat pulses |
 
 ---
@@ -173,9 +173,18 @@ aula-f75-rs profile list
 # Show profile configuration details
 aula-f75-rs profile show NAME
 
+# Set profile as default startup profile
+aula-f75-rs profile set-default NAME
+
+# Clear default startup profile marker
+aula-f75-rs profile clear-default
+
 # Delete a saved profile
 aula-f75-rs profile delete NAME
 ```
+
+> [!NOTE]
+> **Default Profile Indicator**: When a default profile is set, `aula-f75-rs profile list` marks it with `(default)` and `aula-f75-rs profile show` displays `Profile: NAME (default)`. Deleting the active default profile automatically clears the marker.
 
 See [profiles.md](profiles.md) for full schema and configuration documentation.
 

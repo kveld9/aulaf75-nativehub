@@ -509,6 +509,75 @@ pub fn list_profiles(base_dir: Option<&Path>) -> Result<Vec<String>, String> {
     Ok(profiles)
 }
 
+/// Resolve the default profile marker path inside the profiles directory.
+fn default_marker_path(base_dir: Option<&Path>) -> Result<PathBuf, String> {
+    let dir = resolve_profiles_dir(base_dir)?;
+    Ok(dir.join("default"))
+}
+
+/// Retrieve the currently configured default profile name, if any.
+///
+/// Returns `None` if the marker is missing, empty, contains only whitespace,
+/// or points to a profile (`<name>.toml`) that does not exist on disk.
+pub fn get_default_profile(base_dir: Option<&Path>) -> Option<String> {
+    let marker_path = default_marker_path(base_dir).ok()?;
+    if !marker_path.is_file() {
+        return None;
+    }
+    let content = fs::read_to_string(&marker_path).ok()?;
+    let name = content.trim();
+    if name.is_empty() || validate_profile_name(name).is_err() {
+        return None;
+    }
+    let dir = resolve_profiles_dir(base_dir).ok()?;
+    let profile_file = dir.join(format!("{}.toml", name));
+    if !profile_file.is_file() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Set a saved profile as the default startup profile.
+///
+/// The target profile must exist and pass validation via `load_profile`.
+pub fn set_default_profile(name: &str, base_dir: Option<&Path>) -> Result<(), String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Profile name cannot be empty".to_string());
+    }
+    // Verify target profile exists and loads validly
+    load_profile(trimmed, base_dir)?;
+
+    let dir = resolve_profiles_dir(base_dir)?;
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create profiles directory {}: {}", dir.display(), e))?;
+
+    let marker_path = dir.join("default");
+    fs::write(&marker_path, format!("{}\n", trimmed)).map_err(|e| {
+        format!(
+            "Failed to write default profile marker {}: {}",
+            marker_path.display(),
+            e
+        )
+    })?;
+    Ok(())
+}
+
+/// Clear the default startup profile marker if present.
+pub fn clear_default_profile(base_dir: Option<&Path>) -> Result<(), String> {
+    let marker_path = default_marker_path(base_dir)?;
+    if marker_path.exists() {
+        fs::remove_file(&marker_path).map_err(|e| {
+            format!(
+                "Failed to remove default profile marker {}: {}",
+                marker_path.display(),
+                e
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// Delete a profile file `<name>.toml` from disk.
 pub fn delete_profile(name: &str, base_dir: Option<&Path>) -> Result<(), String> {
     let trimmed = name.trim();
@@ -524,8 +593,16 @@ pub fn delete_profile(name: &str, base_dir: Option<&Path>) -> Result<(), String>
             file_path.display()
         ));
     }
+    let was_default = fs::read_to_string(dir.join("default"))
+        .map(|c| c.trim() == trimmed)
+        .unwrap_or(false);
+
     fs::remove_file(&file_path)
         .map_err(|e| format!("Failed to delete profile {}: {}", file_path.display(), e))?;
+
+    if was_default {
+        let _ = clear_default_profile(base_dir);
+    }
     Ok(())
 }
 

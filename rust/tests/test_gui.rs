@@ -5,7 +5,11 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use aula_f75::cli::profile::{save_profile, set_default_profile, Profile};
 use aula_f75::effects::Effect;
+use aula_f75::gui::state::{
+    initial_worker_message_for_profile, resolve_initial_worker_message, resolve_startup_profile,
+};
 use aula_f75::gui::{
     parse_color_hex, run_worker_reconnect_loop, run_worker_stream, AulaF75App, GuiLightingMode,
     GuiState, WorkerMessage, WorkerStatus,
@@ -769,5 +773,163 @@ fn test_effects_from_name_with_speed_halves_periods() {
 
     let off = Effect::from_name_with_speed("off", None, 2.0).unwrap();
     assert_eq!(off, Effect::Off);
+}
+
+static GUI_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct GuiTestTempDir {
+    path: PathBuf,
+}
+
+impl GuiTestTempDir {
+    fn new(prefix: &str) -> Self {
+        let unique = format!(
+            "aula_f75_gui_test_{}_{}_{}",
+            prefix,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&path).expect("Failed to create temp dir");
+        Self { path }
+    }
+}
+
+impl Drop for GuiTestTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[test]
+fn test_gui_startup_selection_prefers_default_over_alphabetical_first() {
+    let _lock = GUI_TEST_ENV_LOCK.lock().unwrap();
+    let tmp = GuiTestTempDir::new("startup_pref");
+    let prev_env = std::env::var("AULA_F75_CONFIG").ok();
+    std::env::set_var("AULA_F75_CONFIG", &tmp.path);
+
+    let p1 = Profile::new("alpha", "rainbow", None, 1.0, Vec::new());
+    let p2 = Profile::new("bravo", "wave", None, 1.0, Vec::new());
+    let p3 = Profile::new("charlie", "stars", None, 1.0, Vec::new());
+
+    save_profile(&p1, None).unwrap();
+    save_profile(&p2, None).unwrap();
+    save_profile(&p3, None).unwrap();
+
+    let saved = vec!["alpha".to_string(), "bravo".to_string(), "charlie".to_string()];
+
+    // Without default: startup selection resolves to alphabetical first ("alpha")
+    assert_eq!(
+        resolve_startup_profile(&saved, None),
+        Some("alpha".to_string())
+    );
+    let app_bare = AulaF75App::default();
+    assert_eq!(app_bare.selected_profile, Some("alpha".to_string()));
+    assert_eq!(app_bare.state.mode, GuiLightingMode::Off);
+    assert_eq!(app_bare.brightness, 1.0);
+    assert_eq!(app_bare.effect_speed, 1.0);
+    assert_eq!(app_bare.selected_effect, "Solid");
+    assert!(!app_bare.streamed);
+    assert!(!app_bare.is_worker_running());
+
+    // Set "charlie" as default: startup selection must now prefer "charlie"
+    set_default_profile("charlie", None).unwrap();
+    assert_eq!(
+        resolve_startup_profile(&saved, None),
+        Some("charlie".to_string())
+    );
+    let app_default = AulaF75App::default();
+    assert_eq!(app_default.selected_profile, Some("charlie".to_string()));
+    assert_eq!(app_default.selected_effect, "Stars");
+    assert!(app_default.streamed);
+    assert!(!app_default.is_worker_running());
+
+    match prev_env {
+        Some(v) => std::env::set_var("AULA_F75_CONFIG", v),
+        None => std::env::remove_var("AULA_F75_CONFIG"),
+    }
+}
+
+#[test]
+fn test_gui_initial_worker_message_mapping_and_fallback() {
+    let _lock = GUI_TEST_ENV_LOCK.lock().unwrap();
+    let tmp = GuiTestTempDir::new("worker_msg_map");
+    let prev_env = std::env::var("AULA_F75_CONFIG").ok();
+    std::env::set_var("AULA_F75_CONFIG", &tmp.path);
+
+    // Fallback when no default exists: resolve_initial_worker_message is None
+    assert_eq!(resolve_initial_worker_message(None), None);
+    let app = AulaF75App::default();
+    assert_eq!(app.initial_worker_message(), None);
+
+    // 1. Initial WorkerMessage mapping for an effect profile
+    let prof_wave = Profile::new_with_speed("speedy_wave", "wave", None, 0.75, 1.5, Vec::new());
+    save_profile(&prof_wave, None).unwrap();
+    set_default_profile("speedy_wave", None).unwrap();
+
+    let msg_fx = resolve_initial_worker_message(None).unwrap();
+    assert_eq!(
+        msg_fx,
+        WorkerMessage::SetEffect {
+            effect: Effect::Wave { period_s: 2.0 },
+            brightness: 0.75,
+        }
+    );
+
+    let app_fx = AulaF75App::default();
+    assert_eq!(app_fx.brightness, 0.75);
+    assert_eq!(app_fx.effect_speed, 1.5);
+    assert_eq!(app_fx.selected_effect, "Wave");
+    assert!(app_fx.streamed);
+    assert!(!app_fx.last_was_keyframe);
+    assert!(!app_fx.is_worker_running());
+    assert_eq!(app_fx.initial_worker_message(), Some(msg_fx));
+
+    // Pure helper in-memory verification for effects
+    assert_eq!(
+        initial_worker_message_for_profile(&prof_wave),
+        WorkerMessage::SetEffect {
+            effect: Effect::Wave { period_s: 2.0 },
+            brightness: 0.75,
+        }
+    );
+    let prof_off = Profile::new("shutoff", "off", None, 1.0, Vec::new());
+    assert_eq!(
+        initial_worker_message_for_profile(&prof_off),
+        WorkerMessage::Off
+    );
+
+    // 2. Initial WorkerMessage mapping for a keyframe profile
+    let keys = vec![
+        ("esc".to_string(), (255, 0, 0)),
+        ("space".to_string(), (0, 255, 0)),
+    ];
+    let prof_keys = Profile::new("gaming", "off", None, 0.85, keys.clone());
+    save_profile(&prof_keys, None).unwrap();
+    set_default_profile("gaming", None).unwrap();
+
+    let msg_keys = resolve_initial_worker_message(None).unwrap();
+    assert_eq!(msg_keys, WorkerMessage::SetKeyFrame(keys.clone()));
+
+    let app_keys = AulaF75App::default();
+    assert_eq!(app_keys.brightness, 0.85);
+    assert!(app_keys.streamed);
+    assert!(app_keys.last_was_keyframe);
+    assert!(!app_keys.is_worker_running());
+    assert_eq!(app_keys.initial_worker_message(), Some(msg_keys));
+
+    // Pure helper in-memory verification for keyframe
+    assert_eq!(
+        initial_worker_message_for_profile(&prof_keys),
+        WorkerMessage::SetKeyFrame(keys)
+    );
+
+    match prev_env {
+        Some(v) => std::env::set_var("AULA_F75_CONFIG", v),
+        None => std::env::remove_var("AULA_F75_CONFIG"),
+    }
 }
 

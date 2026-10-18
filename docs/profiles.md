@@ -77,6 +77,16 @@ aula-f75-rs profile list
 aula-f75-rs profile show fps-wasd
 ```
 
+### Set Default Profile
+```bash
+aula-f75-rs profile set-default rainbow-chill
+```
+
+### Clear Default Profile
+```bash
+aula-f75-rs profile clear-default
+```
+
 ### Delete a Profile
 ```bash
 aula-f75-rs profile delete cyan-work
@@ -84,10 +94,30 @@ aula-f75-rs profile delete cyan-work
 
 ---
 
+## Default Profile
+
+The default profile feature allows designating a chosen preset that automatically activates whenever the GUI starts.
+
+### Marker Location & Semantics
+- **Marker File**: Persisted in a plain text file named `default` (no file extension) located directly inside the profiles directory (`$XDG_CONFIG_HOME/aula-f75/profiles/default` or `$AULA_F75_CONFIG/profiles/default`).
+- **Content**: Plain trimmed profile name string. Because the file lacks a `.toml` extension, `profile list` output is unaffected.
+- **Resilience**: Missing, empty, whitespace-only, or stale markers pointing to deleted `.toml` files resolve safely to `None` without crashing.
+- **Auto-Deletion Cleanup**: When deleting a profile via CLI or GUI that is currently set as default, the `default` marker file is automatically cleared.
+
+### GUI Startup Auto-Apply
+When a valid default profile is configured:
+- The desktop GUI (`aula-f75-gui`) starts with the default profile's visuals (color, hex input, brightness, speed, selected effect, and mode) pre-applied.
+- The background streaming worker immediately begins streaming the default profile frames (solid/effect or keyframe) upon launch instead of sitting in the bare stock idle state.
+- In the Profiles panel, the default profile is badged with `(default)` in the dropdown selector, and "Set as default" / "Clear default" buttons allow quick preset management.
+
+---
+
 ## GUI Integration
 
 The native desktop GUI (`aula-f75-gui`) includes an integrated **Lighting Profiles** panel allowing you to:
 - Select and apply any profile from a dropdown list with a single click.
+- Identify the active default profile via a visible `(default)` badge.
+- Set or clear the default startup profile using "Set as default" and "Clear default" buttons.
 - Save the currently active effect, color, brightness, and speed under a new profile name.
 - Delete unwanted profiles from disk immediately.
 

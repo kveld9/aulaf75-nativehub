@@ -4,8 +4,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use aula_f75::cli::profile::{
-    delete_profile, list_profiles, load_profile, parse_from_str, resolve_profiles_dir,
-    save_profile, AppliedProfileParams, Profile,
+    clear_default_profile, delete_profile, get_default_profile, list_profiles, load_profile,
+    parse_from_str, resolve_profiles_dir, save_profile, set_default_profile, AppliedProfileParams,
+    Profile,
 };
 use aula_f75::effects::Effect;
 
@@ -353,4 +354,102 @@ fn test_gui_profiles_lifecycle() {
         Some(v) => std::env::set_var("AULA_F75_CONFIG", v),
         None => std::env::remove_var("AULA_F75_CONFIG"),
     }
+}
+
+#[test]
+fn test_default_profile_marker_roundtrip() {
+    let tmp = TempDir::new("marker_roundtrip");
+    let prof1 = Profile::new("alpha", "rainbow", None, 1.0, Vec::new());
+    let prof2 = Profile::new("beta", "wave", None, 1.0, Vec::new());
+
+    save_profile(&prof1, Some(&tmp.path)).unwrap();
+    save_profile(&prof2, Some(&tmp.path)).unwrap();
+
+    // Initially no default profile
+    assert_eq!(get_default_profile(Some(&tmp.path)), None);
+
+    // Set beta as default
+    set_default_profile("beta", Some(&tmp.path)).expect("Failed to set default profile");
+    assert_eq!(
+        get_default_profile(Some(&tmp.path)),
+        Some("beta".to_string())
+    );
+
+    // Verify marker file contents
+    let marker_path = tmp.path.join("default");
+    assert!(marker_path.is_file());
+    assert_eq!(fs::read_to_string(&marker_path).unwrap().trim(), "beta");
+
+    // Clear default profile
+    clear_default_profile(Some(&tmp.path)).expect("Failed to clear default profile");
+    assert_eq!(get_default_profile(Some(&tmp.path)), None);
+    assert!(!marker_path.exists());
+
+    // Clearing when already absent is idempotent and Ok
+    assert!(clear_default_profile(Some(&tmp.path)).is_ok());
+}
+
+#[test]
+fn test_set_default_profile_rejects_nonexistent_and_empty() {
+    let tmp = TempDir::new("set_default_errors");
+
+    // Reject empty or whitespace-only names
+    assert!(set_default_profile("", Some(&tmp.path)).is_err());
+    assert!(set_default_profile("   ", Some(&tmp.path)).is_err());
+
+    // Reject nonexistent profile
+    let err = set_default_profile("ghost_profile", Some(&tmp.path));
+    assert!(err.is_err());
+    assert!(err.unwrap_err().contains("not found"));
+}
+
+#[test]
+fn test_default_profile_empty_whitespace_and_stale_read_as_none() {
+    let tmp = TempDir::new("stale_default");
+    let marker_path = tmp.path.join("default");
+
+    // 1. Empty marker file
+    fs::write(&marker_path, "").unwrap();
+    assert_eq!(get_default_profile(Some(&tmp.path)), None);
+
+    // 2. Whitespace-only marker file
+    fs::write(&marker_path, "   \n\t  \n").unwrap();
+    assert_eq!(get_default_profile(Some(&tmp.path)), None);
+
+    // 3. Stale marker pointing to nonexistent profile
+    fs::write(&marker_path, "deleted_preset\n").unwrap();
+    assert_eq!(get_default_profile(Some(&tmp.path)), None);
+}
+
+#[test]
+fn test_delete_profile_clears_default_marker() {
+    let tmp = TempDir::new("delete_clears_default");
+    let prof = Profile::new("transient_def", "stars", None, 1.0, Vec::new());
+    save_profile(&prof, Some(&tmp.path)).unwrap();
+
+    set_default_profile("transient_def", Some(&tmp.path)).unwrap();
+    assert_eq!(
+        get_default_profile(Some(&tmp.path)),
+        Some("transient_def".to_string())
+    );
+
+    // Deleting the default profile must clear the default marker
+    delete_profile("transient_def", Some(&tmp.path)).unwrap();
+    assert_eq!(get_default_profile(Some(&tmp.path)), None);
+    assert!(!tmp.path.join("default").exists());
+}
+
+#[test]
+fn test_list_profiles_ignores_default_marker_file() {
+    let tmp = TempDir::new("list_ignores_marker");
+    let prof = Profile::new("visible_profile", "solid", Some((255, 0, 0)), 1.0, Vec::new());
+    save_profile(&prof, Some(&tmp.path)).unwrap();
+    set_default_profile("visible_profile", Some(&tmp.path)).unwrap();
+
+    // The default marker file exists
+    assert!(tmp.path.join("default").is_file());
+
+    // list_profiles should only return .toml profiles, never 'default'
+    let list = list_profiles(Some(&tmp.path)).unwrap();
+    assert_eq!(list, vec!["visible_profile"]);
 }

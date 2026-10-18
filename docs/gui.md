@@ -60,9 +60,12 @@ Selectable card strip for instant switching between:
 
 ### Lighting Profiles Panel
 Integrated management interface for persistent presets:
-- Dropdown selector listing saved local profiles.
+- Dropdown selector listing saved local profiles, highlighting the default startup profile with a `(default)` badge.
+- **Set as default** button to configure the currently selected profile as the startup default.
+- **Clear default** button to remove the startup default marker.
+- **Startup Auto-Apply & Stream**: When a valid default profile exists, launching `aula-f75-gui` automatically initializes with that profile applied and immediately begins streaming it to the keyboard.
 - **Apply** button to immediately stream preset parameters.
-- **Delete** button to remove unwanted profile files.
+- **Delete** button to remove unwanted profile files (automatically unsets the default marker if the deleted profile was default).
 - **Save Profile** input capturing active effect, color, brightness, and speed into `$XDG_CONFIG_HOME/aula-f75/profiles/`.
 
 ### Audio Reactive Lighting (Music Mode)
