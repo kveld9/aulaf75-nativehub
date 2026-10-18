@@ -23,10 +23,6 @@ The AULA F75 keyboard exposes USB HID interfaces (typical VID `258a`, PID `010c`
 - **Hard Safety Rule — Report 5 Prohibition**: Never send data on Report ID 5. On this MCU family, Report 5 is a write-only command mailbox where blind writes risk entering the ISP firmware-flash bootloader (soft-brick). Report 5 remains unimplemented and prohibited.
 - **No Blind Protocol Writes**: Non-verified feature-report writes (key remapping, macros) remain disabled until payload structures are verified.
 
-## Python Prototype Retirement
-
-The original Python prototype (`aula_f75/`, `pyproject.toml`) developed in Tranches 1 and 2 served as the initial reverse-engineering harness and protocol verification testbed. With the completion of the standalone native Rust toolchain (`aula-f75-rs` CLI and `aula-f75-gui` desktop app), the Python prototype has been retired and removed from the repository. The Rust implementation is self-contained, high-performance, and has zero external runtime dependencies beyond `libc`.
-
 ## Installation
 
 ### Prerequisites
@@ -297,9 +293,9 @@ cargo run --bin aula-f75-gui
 > [!NOTE]
 > **CUSTOM Mode Requirement**: The physical keyboard must be toggled into its onboard "Custom" / user static RGB mode (via onboard Fn shortcuts) for software-driven colors to display.
 
-## Local Lighting Profiles (Tranche 7)
+## Local Lighting Profiles
 
-Tranche 7 introduces fully offline, local lighting profiles for saving, loading, listing, and applying lighting configurations across both CLI and GUI.
+Lighting profiles are fully offline, local files for saving, loading, listing, and applying lighting configurations across both CLI and GUI.
 
 ### Storage Location & Environment Overrides
 
@@ -318,6 +314,7 @@ Each profile is stored as a flat `key = value` text file parsed strictly with fi
 name = fps-wasd
 effect = off
 brightness = 0.80
+speed = 1.00
 key.w = FF0000
 key.a = FF0000
 key.s = FF0000
@@ -330,6 +327,7 @@ Supported keys:
 - `effect`: Host effect name (`solid`, `rainbow`, `wave`, `breathe`, `stars`, `off`, `custom`).
 - `color`: 6-digit hex color triplet (`RRGGBB`) required for `solid` and `breathe`.
 - `brightness`: Floating point multiplier clamped to `0.0`..=`1.0`.
+- `speed`: Animation speed factor clamped to `0.25`..=`3.0` (default `1.0`).
 - `key.<name>`: Per-key RGB color override where `<name>` is any valid key or alias recognized by the keymap (e.g. `key.esc = FF0000`).
 
 ### CLI Commands
@@ -351,9 +349,9 @@ aula-f75-rs profile show NAME
 aula-f75-rs profile delete NAME
 ```
 
-## System Audio Reactive Lighting (Tranche 8)
+## System Audio Reactive Lighting
 
-Tranche 8 provides host-driven, audio-reactive RGB lighting (`music` mode) powered by the Linux audio stack without adding external native C/C++ audio library dependencies.
+Audio-reactive RGB lighting (`music` mode) is powered by the Linux audio stack without adding external native C/C++ audio library dependencies.
 
 ### Architecture & Design
 
