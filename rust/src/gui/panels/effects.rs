@@ -83,7 +83,8 @@ impl AulaF75App {
                 self.status_text = format!("Streaming solid #{:02X}{:02X}{:02X}", rgb.0, rgb.1, rgb.2);
             }
         } else {
-            self.start_worker(WorkerMessage::SetColor(rgb));
+            let msg = self.state.transition_to_solid(rgb);
+            self.start_worker(msg);
         }
     }
 

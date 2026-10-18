@@ -492,13 +492,19 @@ fn test_start_when_worker_alive_does_not_duplicate() {
     let mut app = AulaF75App::default();
 
     // Start worker first time
-    app.start_worker(WorkerMessage::SetColor((255, 0, 0)));
+    let msg1 = app.state.transition_to_solid((255, 0, 0));
+    app.start_worker(msg1);
     assert!(app.is_worker_running());
+    assert_eq!(app.state.mode, GuiLightingMode::Solid);
+    assert_eq!(app.state.rgb, (255, 0, 0));
     let thread_id_1 = app.worker_handle.as_ref().unwrap().thread().id();
 
-    // Attempt to start worker again while it is already running
-    app.start_worker(WorkerMessage::SetColor((0, 255, 0)));
+    // Attempt to start worker again while it is already running (warm path)
+    let msg2 = app.state.transition_to_solid((0, 255, 0));
+    app.start_worker(msg2);
     assert!(app.is_worker_running());
+    assert_eq!(app.state.mode, GuiLightingMode::Solid);
+    assert_eq!(app.state.rgb, (0, 255, 0));
     let thread_id_2 = app.worker_handle.as_ref().unwrap().thread().id();
 
     // Worker thread must NOT be duplicated or respawned
@@ -507,15 +513,20 @@ fn test_start_when_worker_alive_does_not_duplicate() {
     // Clean up worker
     app.stop_worker();
     assert!(!app.is_worker_running());
+    assert_eq!(app.state.mode, GuiLightingMode::Off);
 
     // Calling start_worker after stopping should respawn a fresh thread
-    app.start_worker(WorkerMessage::SetColor((0, 0, 255)));
+    let msg3 = app.state.transition_to_solid((0, 0, 255));
+    app.start_worker(msg3);
     assert!(app.is_worker_running());
+    assert_eq!(app.state.mode, GuiLightingMode::Solid);
+    assert_eq!(app.state.rgb, (0, 0, 255));
     let thread_id_3 = app.worker_handle.as_ref().unwrap().thread().id();
     assert_ne!(thread_id_1, thread_id_3);
 
     app.stop_worker();
     assert!(!app.is_worker_running());
+    assert_eq!(app.state.mode, GuiLightingMode::Off);
 }
 
 #[test]
@@ -1111,5 +1122,257 @@ fn test_truly_idle_session_preserves_service_state_without_adopting() {
         None => std::env::remove_var("AULA_F75_CONFIG"),
     }
 }
+
+#[test]
+fn test_cold_start_worker_keyframe_preserves_flags_and_adopts_fallback_color() {
+    let _lock = GUI_TEST_ENV_LOCK.lock().unwrap();
+    let tmp = GuiTestTempDir::new("cold_keyframe");
+    let prev_env = std::env::var("AULA_F75_CONFIG").ok();
+    std::env::set_var("AULA_F75_CONFIG", &tmp.path);
+
+    let unit_path = tmp.path.join("aula-f75.service");
+    let initial_content = "[Unit]\nDescription=AULA F75\n\n[Service]\nType=simple\nExecStart=%h/.local/bin/aula-f75-rs solid 303030\n\n[Install]\nWantedBy=default.target\n";
+    std::fs::write(&unit_path, initial_content).unwrap();
+
+    let fake = FakeServiceRunner::new(false);
+    let mut app = AulaF75App::new_with_service_runner(fake.clone());
+    app.custom_service_unit_path = Some(unit_path.clone());
+    app.color_rgb = [0, 255, 128];
+    app.state.rgb = (0, 255, 128);
+
+    assert!(!app.is_worker_running());
+
+    let keyframe_msg = app.state.transition_to_keyframe(vec![("esc".to_string(), (255, 0, 0))]);
+    app.start_worker(keyframe_msg);
+
+    assert!(app.is_worker_running());
+    assert!(app.last_was_keyframe);
+    assert!(app.state.last_was_keyframe);
+    assert!(app.is_streaming());
+
+    drop(app);
+
+    assert_eq!(fake.restart_count(), 1);
+    let content = std::fs::read_to_string(&unit_path).unwrap();
+    assert!(content.contains("ExecStart=%h/.local/bin/aula-f75-rs solid 00FF80"));
+    assert!(!content.contains("solid 000000"));
+
+    match prev_env {
+        Some(v) => std::env::set_var("AULA_F75_CONFIG", v),
+        None => std::env::remove_var("AULA_F75_CONFIG"),
+    }
+}
+
+#[test]
+fn test_cold_start_worker_effect_preserves_mode_and_adopts_fx_args() {
+    let _lock = GUI_TEST_ENV_LOCK.lock().unwrap();
+    let tmp = GuiTestTempDir::new("cold_effect");
+    let prev_env = std::env::var("AULA_F75_CONFIG").ok();
+    std::env::set_var("AULA_F75_CONFIG", &tmp.path);
+
+    let unit_path = tmp.path.join("aula-f75.service");
+    let initial_content = "[Unit]\nDescription=AULA F75\n\n[Service]\nType=simple\nExecStart=%h/.local/bin/aula-f75-rs solid 303030\n\n[Install]\nWantedBy=default.target\n";
+    std::fs::write(&unit_path, initial_content).unwrap();
+
+    let fake = FakeServiceRunner::new(false);
+    let mut app = AulaF75App::new_with_service_runner(fake.clone());
+    app.custom_service_unit_path = Some(unit_path.clone());
+    app.brightness = 0.8;
+    app.effect_speed = 1.5;
+    app.selected_effect = "Rainbow".to_string();
+
+    assert!(!app.is_worker_running());
+
+    let rainbow = Effect::Rainbow { period_s: 5.0 };
+    let msg = app.state.transition_to_effect(rainbow.clone(), 0.8);
+    app.start_worker(msg);
+
+    assert!(app.is_worker_running());
+    assert_eq!(app.state.mode, GuiLightingMode::Effect(rainbow));
+    assert!(app.is_streaming());
+
+    drop(app);
+
+    assert_eq!(fake.restart_count(), 1);
+    let content = std::fs::read_to_string(&unit_path).unwrap();
+    assert!(content.contains("ExecStart=%h/.local/bin/aula-f75-rs fx rainbow --brightness 0.8 --speed 1.5"));
+    assert!(!content.contains("solid 000000"));
+
+    match prev_env {
+        Some(v) => std::env::set_var("AULA_F75_CONFIG", v),
+        None => std::env::remove_var("AULA_F75_CONFIG"),
+    }
+}
+
+#[test]
+fn test_cold_on_solid_clicked_sets_solid_mode_and_adopts_color() {
+    let _lock = GUI_TEST_ENV_LOCK.lock().unwrap();
+    let tmp = GuiTestTempDir::new("cold_solid");
+    let prev_env = std::env::var("AULA_F75_CONFIG").ok();
+    std::env::set_var("AULA_F75_CONFIG", &tmp.path);
+
+    let unit_path = tmp.path.join("aula-f75.service");
+    let initial_content = "[Unit]\nDescription=AULA F75\n\n[Service]\nType=simple\nExecStart=%h/.local/bin/aula-f75-rs solid 303030\n\n[Install]\nWantedBy=default.target\n";
+    std::fs::write(&unit_path, initial_content).unwrap();
+
+    let fake = FakeServiceRunner::new(false);
+    let mut app = AulaF75App::new_with_service_runner(fake.clone());
+    app.custom_service_unit_path = Some(unit_path.clone());
+    app.hex_input = "00E0A0".to_string();
+
+    assert!(!app.is_worker_running());
+    assert_eq!(app.state.mode, GuiLightingMode::Off);
+
+    app.on_solid_clicked();
+
+    assert!(app.is_worker_running());
+    assert_eq!(app.state.mode, GuiLightingMode::Solid);
+    assert_eq!(app.state.rgb, (0, 0xE0, 0xA0));
+    assert_eq!(app.color_rgb, [0, 0xE0, 0xA0]);
+    assert!(app.is_streaming());
+
+    drop(app);
+
+    assert_eq!(fake.restart_count(), 1);
+    let content = std::fs::read_to_string(&unit_path).unwrap();
+    assert!(content.contains("ExecStart=%h/.local/bin/aula-f75-rs solid 00E0A0"));
+    assert!(!content.contains("solid 000000"));
+
+    match prev_env {
+        Some(v) => std::env::set_var("AULA_F75_CONFIG", v),
+        None => std::env::remove_var("AULA_F75_CONFIG"),
+    }
+}
+
+#[test]
+fn test_stop_worker_resets_mode_to_off_and_clears_flags() {
+    let mut app = AulaF75App::default();
+    let keyframe_msg = app.state.transition_to_keyframe(vec![("esc".to_string(), (255, 0, 0))]);
+    app.start_worker(keyframe_msg);
+
+    assert!(app.is_worker_running());
+    assert!(app.last_was_keyframe);
+    assert!(app.state.last_was_keyframe);
+
+    app.stop_worker();
+
+    assert!(!app.is_worker_running());
+    assert_eq!(app.state.mode, GuiLightingMode::Off);
+    assert!(!app.last_was_keyframe);
+    assert!(!app.state.last_was_keyframe);
+    assert!(app.worker_tx.is_none());
+    assert!(app.worker_handle.is_none());
+    assert!(app.status_rx.is_none());
+    assert_eq!(app.status_text, "Disconnected");
+}
+
+#[test]
+fn test_on_status_stopped_clears_app_and_state_keyframe_flags() {
+    let mut app = AulaF75App::default();
+    app.last_was_keyframe = true;
+    app.state.last_was_keyframe = true;
+    app.state.mode = GuiLightingMode::Solid;
+
+    let (status_tx, status_rx) = mpsc::channel();
+    app.status_rx = Some(status_rx);
+    status_tx.send(WorkerStatus::Stopped).unwrap();
+
+    app.poll_worker_status();
+
+    assert_eq!(app.state.mode, GuiLightingMode::Off);
+    assert!(!app.last_was_keyframe);
+    assert!(!app.state.last_was_keyframe);
+    assert_eq!(app.status_text, "Disconnected");
+}
+
+#[test]
+fn test_cold_start_worker_idle_preserves_idle_and_restores_service() {
+    let _lock = GUI_TEST_ENV_LOCK.lock().unwrap();
+    let tmp = GuiTestTempDir::new("cold_idle");
+    let prev_env = std::env::var("AULA_F75_CONFIG").ok();
+    std::env::set_var("AULA_F75_CONFIG", &tmp.path);
+
+    let unit_path = tmp.path.join("aula-f75.service");
+    let initial_content = "[Unit]\nDescription=AULA F75\n\n[Service]\nType=simple\nExecStart=%h/.local/bin/aula-f75-rs solid 303030\n\n[Install]\nWantedBy=default.target\n";
+    std::fs::write(&unit_path, initial_content).unwrap();
+
+    let fake = FakeServiceRunner::new(true);
+    let mut app = AulaF75App::new_with_service_runner(fake.clone());
+    app.custom_service_unit_path = Some(unit_path.clone());
+
+    assert!(!app.is_worker_running());
+    assert!(!app.streamed);
+    assert!(!app.state.streamed);
+
+    // Truly-idle cold spawn (cmd None)
+    app.start_worker(None);
+
+    assert!(app.is_worker_running());
+    assert_eq!(app.state.mode, GuiLightingMode::Off);
+    assert!(!app.streamed);
+    assert!(!app.state.streamed);
+    assert!(!app.is_streaming());
+
+    drop(app);
+
+    // Must restore service without adopting
+    assert_eq!(fake.start_count(), 1);
+    assert_eq!(fake.restart_count(), 0);
+    let content = std::fs::read_to_string(&unit_path).unwrap();
+    assert!(content.contains("ExecStart=%h/.local/bin/aula-f75-rs solid 303030"));
+    assert!(!content.contains("solid 000000"));
+
+    match prev_env {
+        Some(v) => std::env::set_var("AULA_F75_CONFIG", v),
+        None => std::env::remove_var("AULA_F75_CONFIG"),
+    }
+}
+
+#[test]
+fn test_cold_start_worker_with_runner_preserves_default_profile_state() {
+    let _lock = GUI_TEST_ENV_LOCK.lock().unwrap();
+    let tmp = GuiTestTempDir::new("default_prof_start");
+    let prev_env = std::env::var("AULA_F75_CONFIG").ok();
+    std::env::set_var("AULA_F75_CONFIG", &tmp.path);
+
+    let unit_path = tmp.path.join("aula-f75.service");
+    let initial_content = "[Unit]\nDescription=AULA F75\n\n[Service]\nType=simple\nExecStart=%h/.local/bin/aula-f75-rs solid 303030\n\n[Install]\nWantedBy=default.target\n";
+    std::fs::write(&unit_path, initial_content).unwrap();
+
+    let prof = Profile::new_with_speed("startup_wave", "wave", None, 0.75, 1.5, Vec::new());
+    save_profile(&prof, None).unwrap();
+    set_default_profile("startup_wave", None).unwrap();
+
+    let mut app = AulaF75App::new_with_runner(
+        Duration::from_millis(10),
+        || None,
+        |_| Ok(()),
+        |_, _| Ok(()),
+        |_| {},
+    );
+    app.custom_service_unit_path = Some(unit_path.clone());
+
+    assert!(app.is_worker_running());
+    assert_eq!(
+        app.state.mode,
+        GuiLightingMode::Effect(Effect::Wave { period_s: 2.0 })
+    );
+    assert_eq!(app.selected_effect, "Wave");
+    assert_eq!(app.brightness, 0.75);
+    assert_eq!(app.effect_speed, 1.5);
+    assert!(app.is_streaming());
+
+    drop(app);
+
+    let content = std::fs::read_to_string(&unit_path).unwrap();
+    assert!(content.contains("ExecStart=%h/.local/bin/aula-f75-rs fx wave --brightness 0.75 --speed 1.5"));
+    assert!(!content.contains("solid 000000"));
+
+    match prev_env {
+        Some(v) => std::env::set_var("AULA_F75_CONFIG", v),
+        None => std::env::remove_var("AULA_F75_CONFIG"),
+    }
+}
+
 
 

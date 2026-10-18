@@ -524,6 +524,7 @@ impl AulaF75App {
         self.control_node_path = None;
         self.state.mode = GuiLightingMode::Off;
         self.state.last_was_keyframe = false;
+        self.last_was_keyframe = false;
         self.last_music_bands.clear();
         self.status_text = "Disconnected".to_string();
     }
@@ -569,7 +570,7 @@ impl AulaF75App {
                 return;
             }
         }
-        self.stop_worker();
+        self.teardown_worker_handles();
 
         let (tx_cmd, rx_cmd) = mpsc::channel();
         let (tx_status, rx_status) = mpsc::channel();
@@ -613,7 +614,7 @@ impl AulaF75App {
                 return;
             }
         }
-        self.stop_worker();
+        self.teardown_worker_handles();
 
         let (tx_cmd, rx_cmd) = mpsc::channel();
         let (tx_status, rx_status) = mpsc::channel();
@@ -639,14 +640,18 @@ impl AulaF75App {
         self.last_error = None;
     }
 
-    /// Terminate worker thread cleanly without blocking the UI thread.
-    pub fn stop_worker(&mut self) {
-        let msg = self.state.transition_to_stop();
+    fn teardown_worker_handles(&mut self) {
         if let Some(tx) = self.worker_tx.take() {
-            let _ = tx.send(msg);
+            let _ = tx.send(WorkerMessage::Stop);
         }
         self.worker_handle = None;
         self.status_rx = None;
+    }
+
+    /// Terminate worker thread cleanly without blocking the UI thread.
+    pub fn stop_worker(&mut self) {
+        let _ = self.state.transition_to_stop();
+        self.teardown_worker_handles();
         self.state.mode = GuiLightingMode::Off;
         self.last_was_keyframe = false;
         self.control_node_path = None;
