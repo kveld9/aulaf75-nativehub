@@ -91,6 +91,10 @@ impl AulaF75App {
     pub fn on_off_clicked(&mut self) {
         self.selected_effect = "Off".to_string();
         let msg = self.state.transition_to_stop();
+        self.streamed = true;
+        self.state.streamed = true;
+        self.last_was_keyframe = false;
+        self.state.last_was_keyframe = false;
         if let Some(ref tx) = self.worker_tx {
             let _ = tx.send(msg);
         } else {

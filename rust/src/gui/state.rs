@@ -114,6 +114,7 @@ impl GuiState {
     /// Transition to stopped state.
     pub fn transition_to_stop(&mut self) -> WorkerMessage {
         self.mode = GuiLightingMode::Off;
+        self.last_was_keyframe = false;
         WorkerMessage::Stop
     }
 }
@@ -444,7 +445,10 @@ impl AulaF75App {
 
     /// Check if lighting streaming is active (solid, effect, or music).
     pub fn is_streaming(&self) -> bool {
-        self.is_worker_running() && self.state.mode != GuiLightingMode::Off
+        self.is_worker_running()
+            && (self.state.mode != GuiLightingMode::Off
+                || self.last_was_keyframe
+                || self.state.last_was_keyframe)
     }
 
     /// Check if music reactive mode is actively streaming.
@@ -519,6 +523,7 @@ impl AulaF75App {
         self.status_rx = None;
         self.control_node_path = None;
         self.state.mode = GuiLightingMode::Off;
+        self.state.last_was_keyframe = false;
         self.last_music_bands.clear();
         self.status_text = "Disconnected".to_string();
     }
@@ -537,7 +542,10 @@ impl AulaF75App {
                 self.state.streamed = true;
                 self.state.last_was_keyframe = true;
             }
-            WorkerMessage::Stop => {}
+            WorkerMessage::Stop => {
+                self.last_was_keyframe = false;
+                self.state.last_was_keyframe = false;
+            }
             _ => {
                 self.streamed = true;
                 self.last_was_keyframe = false;
@@ -640,6 +648,7 @@ impl AulaF75App {
         self.worker_handle = None;
         self.status_rx = None;
         self.state.mode = GuiLightingMode::Off;
+        self.last_was_keyframe = false;
         self.control_node_path = None;
         self.status_text = "Disconnected".to_string();
     }
