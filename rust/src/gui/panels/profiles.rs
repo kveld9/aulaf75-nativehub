@@ -30,42 +30,52 @@ impl AulaF75App {
         }
     }
 
+    fn send_or_start_worker(&mut self, msg: WorkerMessage) {
+        if self.is_worker_running() {
+            if let Some(ref tx) = self.worker_tx {
+                let _ = tx.send(msg);
+            }
+        } else {
+            self.start_worker(msg);
+        }
+    }
+
+    fn set_profile_status_msg(&mut self, msg: String) {
+        self.status_text = msg.clone();
+        self.profile_status = Some(msg);
+    }
+
+    fn update_profile_color(&mut self, c: (u8, u8, u8)) {
+        self.color_rgb = [c.0, c.1, c.2];
+        self.hex_input = format!("{:02X}{:02X}{:02X}", c.0, c.1, c.2);
+        self.hex_error = None;
+    }
+
+    fn apply_key_profile(&mut self, prof: &Profile) {
+        let msg = WorkerMessage::SetKeyFrame(prof.keys.clone());
+        self.send_or_start_worker(msg);
+        let msg_text = format!("Profile '{}' applied ({} keys)", prof.name, prof.keys.len());
+        self.set_profile_status_msg(msg_text);
+    }
+
+    fn apply_effect_profile(&mut self, prof: &Profile) {
+        self.selected_effect = resolve_profile_effect_name(&prof.effect).to_string();
+        self.brightness = prof.brightness;
+        self.effect_speed = prof.speed;
+        if let Some(c) = prof.color {
+            self.update_profile_color(c);
+        }
+        self.dispatch_current_effect();
+        let msg_text = format!("Profile '{}' applied", prof.name);
+        self.set_profile_status_msg(msg_text);
+    }
+
     /// Apply a loaded profile configuration to GUI state and worker thread.
     pub fn apply_profile(&mut self, prof: &Profile) {
         if !prof.keys.is_empty() {
-            let msg = WorkerMessage::SetKeyFrame(prof.keys.clone());
-            if self.is_worker_running() {
-                if let Some(ref tx) = self.worker_tx {
-                    let _ = tx.send(msg);
-                }
-            } else {
-                self.start_worker(msg);
-            }
-            let msg_text = format!("Profile '{}' applied ({} keys)", prof.name, prof.keys.len());
-            self.status_text = msg_text.clone();
-            self.profile_status = Some(msg_text);
+            self.apply_key_profile(prof);
         } else {
-            let effect_name = match prof.effect.to_ascii_lowercase().as_str() {
-                "solid" => "Solid",
-                "rainbow" => "Rainbow",
-                "wave" => "Wave",
-                "breathe" => "Breathe",
-                "stars" => "Stars",
-                "off" => "Off",
-                _ => "Solid",
-            };
-            self.selected_effect = effect_name.to_string();
-            self.brightness = prof.brightness;
-            self.effect_speed = prof.speed;
-            if let Some(c) = prof.color {
-                self.color_rgb = [c.0, c.1, c.2];
-                self.hex_input = format!("{:02X}{:02X}{:02X}", c.0, c.1, c.2);
-                self.hex_error = None;
-            }
-            self.dispatch_current_effect();
-            let msg_text = format!("Profile '{}' applied", prof.name);
-            self.status_text = msg_text.clone();
-            self.profile_status = Some(msg_text);
+            self.apply_effect_profile(prof);
         }
     }
 
@@ -223,4 +233,16 @@ pub fn render_profiles_panel(app: &mut AulaF75App, ui: &mut egui::Ui) {
             ui.colored_label(color, status);
         }
     });
+}
+
+fn resolve_profile_effect_name(effect: &str) -> &'static str {
+    match effect.to_ascii_lowercase().as_str() {
+        "solid" => "Solid",
+        "rainbow" => "Rainbow",
+        "wave" => "Wave",
+        "breathe" => "Breathe",
+        "stars" => "Stars",
+        "off" => "Off",
+        _ => "Solid",
+    }
 }

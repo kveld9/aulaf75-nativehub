@@ -78,38 +78,38 @@ pub enum Effect {
     Off,
 }
 
+fn normalize_speed(speed: f32) -> f64 {
+    if speed.is_nan() {
+        1.0
+    } else {
+        speed.clamp(0.25, 3.0) as f64
+    }
+}
+
+fn require_effect_color(name: &str, color: Option<RGB>) -> Result<RGB, String> {
+    color.ok_or_else(|| format!("Effect '{}' requires --color RRGGBB", name))
+}
+
 impl Effect {
     /// Construct an effect from a case-insensitive name string, optional base color, and animation speed multiplier.
     ///
     /// The speed multiplier is clamped to `0.25..=3.0` and scales periods for `rainbow` (5.0 / speed),
     /// `wave` (3.0 / speed), and `breathe` (4.0 / speed).
     pub fn from_name_with_speed(name: &str, color: Option<RGB>, speed: f32) -> Result<Effect, String> {
-        let sp = if speed.is_nan() {
-            1.0
-        } else {
-            speed.clamp(0.25, 3.0)
-        };
-        let sp = if sp <= 0.0 { 1.0 } else { sp as f64 };
-
+        let sp = normalize_speed(speed);
         let trimmed = name.trim().to_ascii_lowercase();
         match trimmed.as_str() {
-            "solid" => {
-                let c = color.ok_or_else(|| "Effect 'solid' requires --color RRGGBB".to_string())?;
-                Ok(Effect::Solid(c))
-            }
+            "solid" => Ok(Effect::Solid(require_effect_color("solid", color)?)),
             "rainbow" => Ok(Effect::Rainbow {
                 period_s: 5.0 / sp,
             }),
             "wave" => Ok(Effect::Wave {
                 period_s: 3.0 / sp,
             }),
-            "breathe" => {
-                let c = color.ok_or_else(|| "Effect 'breathe' requires --color RRGGBB".to_string())?;
-                Ok(Effect::Breathe {
-                    color: c,
-                    period_s: 4.0 / sp,
-                })
-            }
+            "breathe" => Ok(Effect::Breathe {
+                color: require_effect_color("breathe", color)?,
+                period_s: 4.0 / sp,
+            }),
             "stars" => Ok(Effect::Stars { density: 0.15 }),
             "off" => Ok(Effect::Off),
             _ => Err(format!(
@@ -125,49 +125,66 @@ impl Effect {
     }
 }
 
+fn safe_period(period_s: f64, default_period: f64) -> f64 {
+    if period_s <= 0.0 {
+        default_period
+    } else {
+        period_s
+    }
+}
+
+fn render_rainbow(period_s: f64, t_secs: f64, key_slots: &[u8]) -> Vec<(u8, (u8, u8, u8))> {
+    let period = safe_period(period_s, 5.0);
+    let hue = ((t_secs / period).fract() * 360.0 + 360.0) % 360.0;
+    let rgb = RGB::hsv_to_rgb(hue, 1.0, 1.0).to_tuple();
+    key_slots.iter().map(|&slot| (slot, rgb)).collect()
+}
+
+fn render_wave(period_s: f64, t_secs: f64, key_slots: &[u8]) -> Vec<(u8, (u8, u8, u8))> {
+    let period = safe_period(period_s, 3.0);
+    key_slots
+        .iter()
+        .map(|&slot| {
+            let hue = (((t_secs / period) * 360.0 + (slot as f64 * 8.0)) % 360.0 + 360.0) % 360.0;
+            (slot, RGB::hsv_to_rgb(hue, 1.0, 1.0).to_tuple())
+        })
+        .collect()
+}
+
+fn render_breathe(color: &RGB, period_s: f64, t_secs: f64, key_slots: &[u8]) -> Vec<(u8, (u8, u8, u8))> {
+    let period = safe_period(period_s, 4.0);
+    let factor = (0.5 + 0.5 * (2.0 * std::f64::consts::PI * t_secs / period).sin()) as f32;
+    let rgb = color.scale(factor).to_tuple();
+    key_slots.iter().map(|&slot| (slot, rgb)).collect()
+}
+
+fn compute_star_rgb(slot: u8, t_secs: f64, dens: f32) -> (u8, u8, u8) {
+    let hash = (slot as u64).wrapping_mul(2654435761) ^ ((t_secs * 4.0) as u64);
+    let normalized = ((hash.wrapping_mul(11400714819323198485)) >> 32) as f32 / (u32::MAX as f32);
+    if dens > 0.0 && normalized < dens {
+        let scale_val = (1.0 - (normalized / dens).min(1.0)).max(0.0);
+        RGB(255, 255, 255).scale(scale_val).to_tuple()
+    } else {
+        (0, 0, 0)
+    }
+}
+
+fn render_stars(density: f32, t_secs: f64, key_slots: &[u8]) -> Vec<(u8, (u8, u8, u8))> {
+    let dens = density.clamp(0.0, 1.0);
+    key_slots
+        .iter()
+        .map(|&slot| (slot, compute_star_rgb(slot, t_secs, dens)))
+        .collect()
+}
+
 /// Render an effect at timestamp `t_secs` for given key slots into `(slot, (r, g, b))` pairs.
 pub fn render(effect: &Effect, t_secs: f64, key_slots: &[u8]) -> Vec<(u8, (u8, u8, u8))> {
     match effect {
         Effect::Solid(rgb) => key_slots.iter().map(|&slot| (slot, rgb.to_tuple())).collect(),
-        Effect::Rainbow { period_s } => {
-            let period = if *period_s <= 0.0 { 5.0 } else { *period_s };
-            let hue = ((t_secs / period).fract() * 360.0 + 360.0) % 360.0;
-            let rgb = RGB::hsv_to_rgb(hue, 1.0, 1.0).to_tuple();
-            key_slots.iter().map(|&slot| (slot, rgb)).collect()
-        }
-        Effect::Wave { period_s } => {
-            let period = if *period_s <= 0.0 { 3.0 } else { *period_s };
-            key_slots
-                .iter()
-                .map(|&slot| {
-                    let hue = (((t_secs / period) * 360.0 + (slot as f64 * 8.0)) % 360.0 + 360.0) % 360.0;
-                    (slot, RGB::hsv_to_rgb(hue, 1.0, 1.0).to_tuple())
-                })
-                .collect()
-        }
-        Effect::Breathe { color, period_s } => {
-            let period = if *period_s <= 0.0 { 4.0 } else { *period_s };
-            let factor = (0.5 + 0.5 * (2.0 * std::f64::consts::PI * t_secs / period).sin()) as f32;
-            let rgb = color.scale(factor).to_tuple();
-            key_slots.iter().map(|&slot| (slot, rgb)).collect()
-        }
-        Effect::Stars { density } => {
-            let dens = density.clamp(0.0, 1.0);
-            key_slots
-                .iter()
-                .map(|&slot| {
-                    let hash = (slot as u64).wrapping_mul(2654435761) ^ ((t_secs * 4.0) as u64);
-                    let normalized = ((hash.wrapping_mul(11400714819323198485)) >> 32) as f32 / (u32::MAX as f32);
-                    let rgb = if dens > 0.0 && normalized < dens {
-                        let scale_val = (1.0 - (normalized / dens).min(1.0)).max(0.0);
-                        RGB(255, 255, 255).scale(scale_val).to_tuple()
-                    } else {
-                        (0, 0, 0)
-                    };
-                    (slot, rgb)
-                })
-                .collect()
-        }
+        Effect::Rainbow { period_s } => render_rainbow(*period_s, t_secs, key_slots),
+        Effect::Wave { period_s } => render_wave(*period_s, t_secs, key_slots),
+        Effect::Breathe { color, period_s } => render_breathe(color, *period_s, t_secs, key_slots),
+        Effect::Stars { density } => render_stars(*density, t_secs, key_slots),
         Effect::Off => Vec::new(),
     }
 }

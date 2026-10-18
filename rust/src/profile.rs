@@ -44,6 +44,70 @@ pub enum AppliedProfileParams {
     },
 }
 
+fn validate_profile_name(name: &str) -> Result<(), String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Profile name cannot be empty".to_string());
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..") {
+        return Err(format!(
+            "Profile name {:?} contains invalid path characters",
+            name
+        ));
+    }
+    Ok(())
+}
+
+fn validate_brightness(brightness: f32) -> Result<(), String> {
+    if !(0.0..=1.0).contains(&brightness) || brightness.is_nan() {
+        Err(format!(
+            "Brightness must be between 0.0 and 1.0, got {}",
+            brightness
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_speed(speed: f32) -> Result<(), String> {
+    if !(0.25..=3.0).contains(&speed) || speed.is_nan() {
+        Err(format!(
+            "Speed must be between 0.25 and 3.0, got {}",
+            speed
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_effect(
+    effect: &str,
+    color: Option<(u8, u8, u8)>,
+    speed: f32,
+    has_keys: bool,
+) -> Result<(), String> {
+    let eff_lower = effect.trim().to_ascii_lowercase();
+    if eff_lower == "custom" {
+        if !has_keys {
+            return Err("Effect 'custom' requires at least one per-key override".to_string());
+        }
+        Ok(())
+    } else {
+        let rgb_opt = color.map(|c| RGB(c.0, c.1, c.2));
+        Effect::from_name_with_speed(&eff_lower, rgb_opt, speed)?;
+        Ok(())
+    }
+}
+
+fn validate_key_overrides(keys: &[(String, (u8, u8, u8))]) -> Result<(), String> {
+    for (key_name, _) in keys {
+        if proto::slot_for_key(key_name).is_none() {
+            return Err(format!("Unknown key name: {:?}", key_name));
+        }
+    }
+    Ok(())
+}
+
 impl Profile {
     /// Construct a new Profile instance with default speed 1.0.
     pub fn new(
@@ -97,47 +161,11 @@ impl Profile {
     /// - Custom effect requires at least one per-key override
     /// - All per-key names resolve to physical slots in `proto::slot_for_key`
     pub fn validate(&self) -> Result<(), String> {
-        let trimmed_name = self.name.trim();
-        if trimmed_name.is_empty() {
-            return Err("Profile name cannot be empty".to_string());
-        }
-        if trimmed_name.contains('/') || trimmed_name.contains('\\') || trimmed_name.contains("..") {
-            return Err(format!(
-                "Profile name {:?} contains invalid path characters",
-                self.name
-            ));
-        }
-
-        if !(0.0..=1.0).contains(&self.brightness) || self.brightness.is_nan() {
-            return Err(format!(
-                "Brightness must be between 0.0 and 1.0, got {}",
-                self.brightness
-            ));
-        }
-
-        if !(0.25..=3.0).contains(&self.speed) || self.speed.is_nan() {
-            return Err(format!(
-                "Speed must be between 0.25 and 3.0, got {}",
-                self.speed
-            ));
-        }
-
-        let eff_lower = self.effect.trim().to_ascii_lowercase();
-        if eff_lower == "custom" {
-            if self.keys.is_empty() {
-                return Err("Effect 'custom' requires at least one per-key override".to_string());
-            }
-        } else {
-            let rgb_opt = self.color.map(|c| RGB(c.0, c.1, c.2));
-            Effect::from_name_with_speed(&eff_lower, rgb_opt, self.speed)?;
-        }
-
-        for (key_name, _) in &self.keys {
-            if proto::slot_for_key(key_name).is_none() {
-                return Err(format!("Unknown key name: {:?}", key_name));
-            }
-        }
-
+        validate_profile_name(&self.name)?;
+        validate_brightness(self.brightness)?;
+        validate_speed(self.speed)?;
+        validate_effect(&self.effect, self.color, self.speed, !self.keys.is_empty())?;
+        validate_key_overrides(&self.keys)?;
         Ok(())
     }
 
@@ -248,106 +276,152 @@ pub fn resolve_profiles_dir(base_dir: Option<&Path>) -> Result<PathBuf, String> 
     Err("Could not resolve config directory: HOME and XDG_CONFIG_HOME are unset".to_string())
 }
 
-/// Parse a profile from a flat `key = value` text representation.
-///
-/// Parsing is strict: syntax errors or unknown keys return descriptive errors
-/// indicating the originating file label and line number.
-pub fn parse_from_str(content: &str, file_label: &str) -> Result<Profile, String> {
-    let mut name: Option<String> = None;
-    let mut effect: Option<String> = None;
-    let mut color: Option<(u8, u8, u8)> = None;
-    let mut brightness: Option<f32> = None;
-    let mut speed: Option<f32> = None;
-    let mut keys: Vec<(String, (u8, u8, u8))> = Vec::new();
+#[derive(Default)]
+struct ProfileBuilder {
+    name: Option<String>,
+    effect: Option<String>,
+    color: Option<(u8, u8, u8)>,
+    brightness: Option<f32>,
+    speed: Option<f32>,
+    keys: Vec<(String, (u8, u8, u8))>,
+}
 
-    for (idx, line) in content.lines().enumerate() {
-        let line_num = idx + 1;
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
+fn parse_color_field(v: &str, file_label: &str, line_num: usize) -> Result<(u8, u8, u8), String> {
+    parse_color_hex(v).map_err(|e| format!("{}:{}: {}", file_label, line_num, e))
+}
 
-        let (k_raw, v_raw) = trimmed.split_once('=').ok_or_else(|| {
-            format!(
-                "{}:{}: Missing '=' in key=value pair: {:?}",
-                file_label, line_num, line
-            )
-        })?;
+fn parse_brightness_field(v: &str, file_label: &str, line_num: usize) -> Result<f32, String> {
+    v.parse::<f32>()
+        .map_err(|e| format!("{}:{}: Invalid brightness {:?}: {}", file_label, line_num, v, e))
+}
 
-        let k = k_raw.trim();
-        let v = v_raw.trim();
+fn parse_speed_field(v: &str, file_label: &str, line_num: usize) -> Result<f32, String> {
+    v.parse::<f32>()
+        .map_err(|e| format!("{}:{}: Invalid speed {:?}: {}", file_label, line_num, v, e))
+}
 
-        if k.is_empty() {
-            return Err(format!(
-                "{}:{}: Empty key name in line {:?}",
-                file_label, line_num, line
-            ));
-        }
+fn parse_key_override_field(
+    key_suffix: &str,
+    v: &str,
+    file_label: &str,
+    line_num: usize,
+) -> Result<(String, (u8, u8, u8)), String> {
+    let key_name = key_suffix.trim();
+    if key_name.is_empty() {
+        return Err(format!(
+            "{}:{}: Empty key name after 'key.'",
+            file_label, line_num
+        ));
+    }
+    let rgb = parse_color_hex(v).map_err(|e| format!("{}:{}: {}", file_label, line_num, e))?;
+    Ok((key_name.to_string(), rgb))
+}
 
-        if k.eq_ignore_ascii_case("name") {
-            name = Some(v.to_string());
-        } else if k.eq_ignore_ascii_case("effect") {
-            effect = Some(v.to_string());
-        } else if k.eq_ignore_ascii_case("color") {
-            let rgb =
-                parse_color_hex(v).map_err(|e| format!("{}:{}: {}", file_label, line_num, e))?;
-            color = Some(rgb);
-        } else if k.eq_ignore_ascii_case("brightness") {
-            let b = v.parse::<f32>().map_err(|e| {
-                format!(
-                    "{}:{}: Invalid brightness {:?}: {}",
-                    file_label, line_num, v, e
-                )
-            })?;
-            brightness = Some(b);
-        } else if k.eq_ignore_ascii_case("speed") {
-            let s = v.parse::<f32>().map_err(|e| {
-                format!(
-                    "{}:{}: Invalid speed {:?}: {}",
-                    file_label, line_num, v, e
-                )
-            })?;
-            speed = Some(s);
-        } else if let Some(key_name) = k.strip_prefix("key.") {
-            let key_name = key_name.trim();
-            if key_name.is_empty() {
-                return Err(format!(
-                    "{}:{}: Empty key name after 'key.'",
-                    file_label, line_num
-                ));
-            }
-            let rgb =
-                parse_color_hex(v).map_err(|e| format!("{}:{}: {}", file_label, line_num, e))?;
-            keys.push((key_name.to_string(), rgb));
-        } else {
-            return Err(format!(
-                "{}:{}: Unknown configuration key {:?}",
-                file_label, line_num, k
-            ));
-        }
+fn parse_kv_line<'a>(
+    line: &'a str,
+    line_num: usize,
+    file_label: &str,
+) -> Result<Option<(&'a str, &'a str)>, String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return Ok(None);
     }
 
-    let effect = effect
+    let (k_raw, v_raw) = trimmed.split_once('=').ok_or_else(|| {
+        format!(
+            "{}:{}: Missing '=' in key=value pair: {:?}",
+            file_label, line_num, line
+        )
+    })?;
+
+    let k = k_raw.trim();
+    if k.is_empty() {
+        return Err(format!(
+            "{}:{}: Empty key name in line {:?}",
+            file_label, line_num, line
+        ));
+    }
+
+    Ok(Some((k, v_raw.trim())))
+}
+
+fn parse_standard_field(
+    builder: &mut ProfileBuilder,
+    k: &str,
+    v: &str,
+    file_label: &str,
+    line_num: usize,
+) -> Result<bool, String> {
+    if k.eq_ignore_ascii_case("name") {
+        builder.name = Some(v.to_string());
+        Ok(true)
+    } else if k.eq_ignore_ascii_case("effect") {
+        builder.effect = Some(v.to_string());
+        Ok(true)
+    } else if k.eq_ignore_ascii_case("color") {
+        builder.color = Some(parse_color_field(v, file_label, line_num)?);
+        Ok(true)
+    } else if k.eq_ignore_ascii_case("brightness") {
+        builder.brightness = Some(parse_brightness_field(v, file_label, line_num)?);
+        Ok(true)
+    } else if k.eq_ignore_ascii_case("speed") {
+        builder.speed = Some(parse_speed_field(v, file_label, line_num)?);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn parse_profile_entry(
+    builder: &mut ProfileBuilder,
+    k: &str,
+    v: &str,
+    file_label: &str,
+    line_num: usize,
+) -> Result<(), String> {
+    if parse_standard_field(builder, k, v, file_label, line_num)? {
+        return Ok(());
+    }
+
+    if let Some(key_suffix) = k.strip_prefix("key.") {
+        let pair = parse_key_override_field(key_suffix, v, file_label, line_num)?;
+        builder.keys.push(pair);
+        return Ok(());
+    }
+
+    Err(format!(
+        "{}:{}: Unknown configuration key {:?}",
+        file_label, line_num, k
+    ))
+}
+
+fn resolve_fallback_profile_name(file_label: &str) -> String {
+    Path::new(file_label)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unnamed")
+        .to_string()
+}
+
+fn build_profile(builder: ProfileBuilder, file_label: &str) -> Result<Profile, String> {
+    let effect = builder
+        .effect
         .ok_or_else(|| format!("{}: Missing required field 'effect'", file_label))?;
 
-    let name = name.unwrap_or_else(|| {
-        Path::new(file_label)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unnamed")
-            .to_string()
-    });
+    let name = builder
+        .name
+        .unwrap_or_else(|| resolve_fallback_profile_name(file_label));
 
-    let brightness = brightness.unwrap_or(1.0);
-    let speed = speed.unwrap_or(1.0);
+    let brightness = builder.brightness.unwrap_or(1.0);
+    let speed = builder.speed.unwrap_or(1.0);
 
     let profile = Profile {
         name,
         effect,
-        color,
+        color: builder.color,
         brightness,
         speed,
-        keys,
+        keys: builder.keys,
     };
 
     profile
@@ -355,6 +429,23 @@ pub fn parse_from_str(content: &str, file_label: &str) -> Result<Profile, String
         .map_err(|e| format!("{}: Validation error: {}", file_label, e))?;
 
     Ok(profile)
+}
+
+/// Parse a profile from a flat `key = value` text representation.
+///
+/// Parsing is strict: syntax errors or unknown keys return descriptive errors
+/// indicating the originating file label and line number.
+pub fn parse_from_str(content: &str, file_label: &str) -> Result<Profile, String> {
+    let mut builder = ProfileBuilder::default();
+
+    for (idx, line) in content.lines().enumerate() {
+        let line_num = idx + 1;
+        if let Some((k, v)) = parse_kv_line(line, line_num, file_label)? {
+            parse_profile_entry(&mut builder, k, v, file_label, line_num)?;
+        }
+    }
+
+    build_profile(builder, file_label)
 }
 
 /// Save a profile to disk under the resolved profiles directory as `<name>.toml`.

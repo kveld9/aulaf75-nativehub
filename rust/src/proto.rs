@@ -131,42 +131,70 @@ pub const KEY_SLOTS: &[(&str, u8)] = &[
     ("right", 89),
 ];
 
+const KEY_ALIASES: &[(&str, &str)] = &[
+    ("escape", "esc"),
+    ("-", "minus"),
+    ("=", "equal"),
+    ("[", "lbracket"),
+    ("]", "rbracket"),
+    ("\\", "backslash"),
+    (";", "semicolon"),
+    ("'", "quote"),
+    (",", "comma"),
+    (".", "dot"),
+    ("/", "slash"),
+    ("`", "backtick"),
+    ("~", "backtick"),
+    ("spacebar", "space"),
+    ("uparrow", "up"),
+    ("up_arrow", "up"),
+    ("up-arrow", "up"),
+    ("arrowup", "up"),
+    ("downarrow", "down"),
+    ("down_arrow", "down"),
+    ("down-arrow", "down"),
+    ("arrowdown", "down"),
+    ("leftarrow", "left"),
+    ("left_arrow", "left"),
+    ("left-arrow", "left"),
+    ("arrowleft", "left"),
+    ("rightarrow", "right"),
+    ("right_arrow", "right"),
+    ("right-arrow", "right"),
+    ("arrowright", "right"),
+    ("delete", "del"),
+    ("pageup", "pgup"),
+    ("pagedown", "pgdn"),
+    ("return", "enter"),
+    ("bksp", "backspace"),
+    ("caps", "capslock"),
+    ("shift", "lshift"),
+    ("leftshift", "lshift"),
+    ("rightshift", "rshift"),
+    ("ctrl", "lctrl"),
+    ("leftctrl", "lctrl"),
+    ("rightctrl", "rctrl"),
+    ("alt", "lalt"),
+    ("leftalt", "lalt"),
+    ("win", "lwin"),
+    ("leftwin", "lwin"),
+    ("super", "lwin"),
+    ("fn", "rfn"),
+];
+
+fn resolve_key_alias(alias: &str) -> &str {
+    for &(k, canonical) in KEY_ALIASES {
+        if k == alias {
+            return canonical;
+        }
+    }
+    alias
+}
+
 /// Resolve the frame slot index for a given key name or alias (case-insensitive).
 pub fn slot_for_key(name: &str) -> Option<u8> {
     let lower = name.trim().to_ascii_lowercase();
-    let canonical = match lower.as_str() {
-        "escape" => "esc",
-        "-" => "minus",
-        "=" => "equal",
-        "[" => "lbracket",
-        "]" => "rbracket",
-        "\\" => "backslash",
-        ";" => "semicolon",
-        "'" => "quote",
-        "," => "comma",
-        "." => "dot",
-        "/" => "slash",
-        "`" | "~" => "backtick",
-        "spacebar" => "space",
-        "uparrow" | "up_arrow" | "up-arrow" | "arrowup" => "up",
-        "downarrow" | "down_arrow" | "down-arrow" | "arrowdown" => "down",
-        "leftarrow" | "left_arrow" | "left-arrow" | "arrowleft" => "left",
-        "rightarrow" | "right_arrow" | "right-arrow" | "arrowright" => "right",
-        "delete" => "del",
-        "pageup" => "pgup",
-        "pagedown" => "pgdn",
-        "return" => "enter",
-        "bksp" => "backspace",
-        "caps" => "capslock",
-        "shift" | "leftshift" => "lshift",
-        "rightshift" => "rshift",
-        "ctrl" | "leftctrl" => "lctrl",
-        "rightctrl" => "rctrl",
-        "alt" | "leftalt" => "lalt",
-        "win" | "leftwin" | "super" => "lwin",
-        "fn" => "rfn",
-        other => other,
-    };
+    let canonical = resolve_key_alias(&lower);
 
     KEY_SLOTS
         .iter()
@@ -329,6 +357,198 @@ pub struct KnobReport {
 ///
 /// Returns `KnobModeSource::Undetermined` with description "undetermined, needs live USB capture"
 /// if the descriptor is empty, malformed, or contains no unambiguous rotary knob usages.
+#[derive(Default)]
+struct KnobScanState {
+    has_consumer_page: bool,
+    has_volume_inc: bool,
+    has_volume_dec: bool,
+    has_mute: bool,
+    has_generic_desktop_page: bool,
+    has_dial: bool,
+    has_wheel: bool,
+    current_page: Option<u16>,
+}
+
+fn skip_long_item(desc: &[u8], i: usize) -> Option<usize> {
+    if desc[i] != 0xFE {
+        return None;
+    }
+    if i + 2 < desc.len() {
+        let data_len = desc[i + 1] as usize;
+        Some(i + 3 + data_len)
+    } else {
+        Some(desc.len())
+    }
+}
+
+fn decode_short_item_len(prefix: u8) -> usize {
+    match prefix & 0x03 {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3 => 4,
+        _ => 0,
+    }
+}
+
+fn parse_item_u16(data: &[u8]) -> u16 {
+    match data.len() {
+        1 => data[0] as u16,
+        2 => (data[0] as u16) | ((data[1] as u16) << 8),
+        _ => 0,
+    }
+}
+
+fn handle_global_item(state: &mut KnobScanState, b_type: u8, b_tag: u8, data: &[u8]) {
+    if b_type != 1 || b_tag != 0 {
+        return;
+    }
+    let page = parse_item_u16(data);
+    state.current_page = Some(page);
+    if page == 0x000C {
+        state.has_consumer_page = true;
+    } else if page == 0x0001 {
+        state.has_generic_desktop_page = true;
+    }
+}
+
+fn is_consumer_context(state: &KnobScanState) -> bool {
+    state.current_page == Some(0x000C) || (state.current_page.is_none() && state.has_consumer_page)
+}
+
+fn is_generic_desktop_context(state: &KnobScanState) -> bool {
+    state.current_page == Some(0x0001) || (state.current_page.is_none() && state.has_generic_desktop_page)
+}
+
+fn record_consumer_usage(state: &mut KnobScanState, usage: u16) {
+    match usage {
+        0x00E9 => state.has_volume_inc = true,
+        0x00EA => state.has_volume_dec = true,
+        0x00E2 => state.has_mute = true,
+        _ => {}
+    }
+}
+
+fn record_generic_desktop_usage(state: &mut KnobScanState, usage: u16) {
+    match usage {
+        0x0037 => state.has_dial = true,
+        0x0038 => state.has_wheel = true,
+        _ => {}
+    }
+}
+
+fn handle_local_item(state: &mut KnobScanState, b_type: u8, b_tag: u8, data: &[u8]) {
+    if b_type != 2 || b_tag != 0 {
+        return;
+    }
+    let usage = parse_item_u16(data);
+    if is_consumer_context(state) {
+        record_consumer_usage(state, usage);
+    } else if is_generic_desktop_context(state) {
+        record_generic_desktop_usage(state, usage);
+    }
+}
+
+fn scan_descriptor_items(desc: &[u8]) -> KnobScanState {
+    let mut state = KnobScanState::default();
+    let mut i = 0;
+
+    while i < desc.len() {
+        if let Some(next_i) = skip_long_item(desc, i) {
+            i = next_i;
+            continue;
+        }
+
+        let prefix = desc[i];
+        let data_bytes = decode_short_item_len(prefix);
+        if i + 1 + data_bytes > desc.len() {
+            break;
+        }
+
+        let item_data = &desc[i + 1..i + 1 + data_bytes];
+        let b_type = (prefix >> 2) & 0x03;
+        let b_tag = (prefix >> 4) & 0x0F;
+
+        handle_global_item(&mut state, b_type, b_tag, item_data);
+        handle_local_item(&mut state, b_type, b_tag, item_data);
+
+        i += 1 + data_bytes;
+    }
+
+    state
+}
+
+fn build_consumer_report(state: &KnobScanState) -> KnobReport {
+    let mut details = vec!["Usage Page: Consumer Control (0x0C)".to_string()];
+    if state.has_volume_inc {
+        details.push("Usage: Volume Increment (0x00E9)".to_string());
+    }
+    if state.has_volume_dec {
+        details.push("Usage: Volume Decrement (0x00EA)".to_string());
+    }
+    if state.has_mute {
+        details.push("Usage: Mute (0x00E2)".to_string());
+    }
+    KnobReport {
+        source: KnobModeSource::ConsumerControl,
+        description: "Consumer Control (Volume Up / Volume Down / Mute)".to_string(),
+        details,
+    }
+}
+
+fn build_generic_desktop_report(state: &KnobScanState) -> KnobReport {
+    let mut details = vec!["Usage Page: Generic Desktop (0x01)".to_string()];
+    if state.has_dial {
+        details.push("Usage: Dial (0x0037)".to_string());
+    }
+    if state.has_wheel {
+        details.push("Usage: Wheel (0x0038)".to_string());
+    }
+    KnobReport {
+        source: KnobModeSource::GenericDesktopDial,
+        description: "Generic Desktop Dial/Wheel (Relative Rotary Encoder)".to_string(),
+        details,
+    }
+}
+
+fn build_undetermined_report() -> KnobReport {
+    KnobReport {
+        source: KnobModeSource::Undetermined,
+        description: "undetermined, needs live USB capture".to_string(),
+        details: vec![
+            "Report descriptor contains no unambiguous Consumer Control volume or Dial/Wheel usages"
+                .to_string(),
+        ],
+    }
+}
+
+fn has_consumer_volume(state: &KnobScanState) -> bool {
+    state.has_consumer_page && (state.has_volume_inc || state.has_volume_dec || state.has_mute)
+}
+
+fn has_generic_dial(state: &KnobScanState) -> bool {
+    state.has_generic_desktop_page && (state.has_dial || state.has_wheel)
+}
+
+fn build_knob_report(state: &KnobScanState) -> KnobReport {
+    if has_consumer_volume(state) {
+        build_consumer_report(state)
+    } else if has_generic_dial(state) {
+        build_generic_desktop_report(state)
+    } else {
+        build_undetermined_report()
+    }
+}
+
+/// Parse a raw HID Report Descriptor to detect rotary knob / volume encoder usages.
+///
+/// Scans for:
+/// 1. Consumer Control usage page (0x05, 0x0C) with volume usages:
+///    Volume Increment (0x09, 0xE9), Volume Decrement (0x09, 0xEA), or Mute (0x09, 0xE2).
+/// 2. Generic Desktop usage page (0x05, 0x01) with Dial (0x09, 0x37) or Wheel (0x09, 0x38).
+///
+/// Returns `KnobModeSource::Undetermined` with description "undetermined, needs live USB capture"
+/// if the descriptor is empty, malformed, or contains no unambiguous rotary knob usages.
 pub fn parse_knob_from_report_descriptor(desc: &[u8]) -> KnobReport {
     if desc.is_empty() {
         return KnobReport {
@@ -338,132 +558,8 @@ pub fn parse_knob_from_report_descriptor(desc: &[u8]) -> KnobReport {
         };
     }
 
-    let mut has_consumer_page = false;
-    let mut has_volume_inc = false;
-    let mut has_volume_dec = false;
-    let mut has_mute = false;
-
-    let mut has_generic_desktop_page = false;
-    let mut has_dial = false;
-    let mut has_wheel = false;
-
-    let mut current_page: Option<u16> = None;
-    let mut i = 0;
-
-    while i < desc.len() {
-        let prefix = desc[i];
-        if prefix == 0xFE {
-            // Long item (prefix 0xFE followed by length byte, tag byte, data)
-            if i + 2 < desc.len() {
-                let data_len = desc[i + 1] as usize;
-                i += 3 + data_len;
-            } else {
-                break;
-            }
-            continue;
-        }
-
-        let b_size = (prefix & 0x03) as usize;
-        let data_bytes = match b_size {
-            0 => 0,
-            1 => 1,
-            2 => 2,
-            3 => 4,
-            _ => 0,
-        };
-
-        if i + 1 + data_bytes > desc.len() {
-            break;
-        }
-
-        let item_data = &desc[i + 1..i + 1 + data_bytes];
-        let b_type = (prefix >> 2) & 0x03;
-        let b_tag = (prefix >> 4) & 0x0F;
-
-        // Global item: Usage Page (bType = 1, bTag = 0)
-        if b_type == 1 && b_tag == 0 {
-            let page = match data_bytes {
-                1 => item_data[0] as u16,
-                2 => (item_data[0] as u16) | ((item_data[1] as u16) << 8),
-                _ => 0,
-            };
-            current_page = Some(page);
-            if page == 0x000C {
-                has_consumer_page = true;
-            } else if page == 0x0001 {
-                has_generic_desktop_page = true;
-            }
-        }
-
-        // Local item: Usage (bType = 2, bTag = 0)
-        if b_type == 2 && b_tag == 0 {
-            let usage = match data_bytes {
-                1 => item_data[0] as u16,
-                2 => (item_data[0] as u16) | ((item_data[1] as u16) << 8),
-                _ => 0,
-            };
-
-            if current_page == Some(0x000C) || (current_page.is_none() && has_consumer_page) {
-                if usage == 0x00E9 {
-                    has_volume_inc = true;
-                } else if usage == 0x00EA {
-                    has_volume_dec = true;
-                } else if usage == 0x00E2 {
-                    has_mute = true;
-                }
-            } else if current_page == Some(0x0001) || (current_page.is_none() && has_generic_desktop_page) {
-                if usage == 0x0037 {
-                    has_dial = true;
-                } else if usage == 0x0038 {
-                    has_wheel = true;
-                }
-            }
-        }
-
-        i += 1 + data_bytes;
-    }
-
-    if has_consumer_page && (has_volume_inc || has_volume_dec || has_mute) {
-        let mut details = vec!["Usage Page: Consumer Control (0x0C)".to_string()];
-        if has_volume_inc {
-            details.push("Usage: Volume Increment (0x00E9)".to_string());
-        }
-        if has_volume_dec {
-            details.push("Usage: Volume Decrement (0x00EA)".to_string());
-        }
-        if has_mute {
-            details.push("Usage: Mute (0x00E2)".to_string());
-        }
-        return KnobReport {
-            source: KnobModeSource::ConsumerControl,
-            description: "Consumer Control (Volume Up / Volume Down / Mute)".to_string(),
-            details,
-        };
-    }
-
-    if has_generic_desktop_page && (has_dial || has_wheel) {
-        let mut details = vec!["Usage Page: Generic Desktop (0x01)".to_string()];
-        if has_dial {
-            details.push("Usage: Dial (0x0037)".to_string());
-        }
-        if has_wheel {
-            details.push("Usage: Wheel (0x0038)".to_string());
-        }
-        return KnobReport {
-            source: KnobModeSource::GenericDesktopDial,
-            description: "Generic Desktop Dial/Wheel (Relative Rotary Encoder)".to_string(),
-            details,
-        };
-    }
-
-    KnobReport {
-        source: KnobModeSource::Undetermined,
-        description: "undetermined, needs live USB capture".to_string(),
-        details: vec![
-            "Report descriptor contains no unambiguous Consumer Control volume or Dial/Wheel usages"
-                .to_string(),
-        ],
-    }
+    let state = scan_descriptor_items(desc);
+    build_knob_report(&state)
 }
 
 #[cfg(test)]

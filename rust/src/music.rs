@@ -405,6 +405,72 @@ pub fn bands_to_colors(
     result
 }
 
+fn is_music_time_expired(start: Instant, seconds: Option<f64>) -> bool {
+    match seconds {
+        Some(sec) => start.elapsed().as_secs_f64() >= sec,
+        None => false,
+    }
+}
+
+enum AudioReadResult {
+    Data(usize),
+    Eof,
+    Retry,
+}
+
+fn read_audio_chunk<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<AudioReadResult, io::Error> {
+    match reader.read(buf) {
+        Ok(0) => Ok(AudioReadResult::Eof),
+        Ok(n) => Ok(AudioReadResult::Data(n)),
+        Err(ref e) if e.kind() == io::ErrorKind::Interrupted => Ok(AudioReadResult::Retry),
+        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+            std::thread::sleep(Duration::from_millis(5));
+            Ok(AudioReadResult::Retry)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn ingest_audio_samples(
+    sample_buf: &mut VecDeque<f32>,
+    chunk_buf: &[u8],
+    bytes_read: usize,
+    gain: f32,
+) {
+    let num_stereo_samples = bytes_read / 4;
+    for i in 0..num_stereo_samples {
+        let offset = i * 4;
+        let left = i16::from_le_bytes([chunk_buf[offset], chunk_buf[offset + 1]]);
+        let right = i16::from_le_bytes([chunk_buf[offset + 2], chunk_buf[offset + 3]]);
+        let mono = ((left as f32 + right as f32) / (2.0 * 32768.0)) * gain;
+        sample_buf.push_back(mono);
+    }
+
+    while sample_buf.len() > 1024 {
+        sample_buf.pop_front();
+    }
+}
+
+fn is_music_tick_due(last_tick: Instant, sample_count: usize) -> bool {
+    sample_count >= 1024 && last_tick.elapsed() >= Duration::from_millis(45)
+}
+
+fn render_music_frame(
+    sample_buf: &VecDeque<f32>,
+    plan: &FftPlan,
+    mags: &mut [f32],
+    autogain: &mut AutoGain,
+    base_color: (u8, u8, u8),
+    mode: MusicMode,
+) -> Result<[u8; FRAME_LEN], io::Error> {
+    let block: Vec<f32> = sample_buf.iter().copied().collect();
+    plan.compute(&block, mags);
+
+    let band_energies = bands_with_autogain(mags, 16, 44100.0, autogain);
+    let pairs = bands_to_colors(&band_energies, base_color, mode);
+    proto::build_slot_frame(&pairs).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+}
+
 /// Generic audio capture streaming loop.
 ///
 /// Reads `s16le` stereo samples from `reader`, mixes them to mono `f32`,
@@ -432,52 +498,32 @@ where
     // Buffer for ~50ms worth of stereo 44.1kHz s16le data (2205 frames * 4 bytes = 8820 bytes)
     let mut chunk_buf = [0u8; 8820];
     let start_time = Instant::now();
-    let mut last_tick = Instant::now().checked_sub(Duration::from_millis(100)).unwrap_or_else(Instant::now);
+    let mut last_tick = Instant::now()
+        .checked_sub(Duration::from_millis(100))
+        .unwrap_or_else(Instant::now);
 
     while is_running_fn() {
-        if let Some(sec) = seconds {
-            if start_time.elapsed().as_secs_f64() >= sec {
-                break;
-            }
+        if is_music_time_expired(start_time, seconds) {
+            break;
         }
 
-        let bytes_read = match reader.read(&mut chunk_buf) {
-            Ok(0) => break, // EOF / clean stop
-            Ok(n) => n,
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(5));
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-
-        // Explicitly convert little-endian i16 bytes without casting
-        let num_stereo_samples = bytes_read / 4;
-        for i in 0..num_stereo_samples {
-            let offset = i * 4;
-            let left = i16::from_le_bytes([chunk_buf[offset], chunk_buf[offset + 1]]);
-            let right = i16::from_le_bytes([chunk_buf[offset + 2], chunk_buf[offset + 3]]);
-            let mono = ((left as f32 + right as f32) / (2.0 * 32768.0)) * gain;
-            sample_buf.push_back(mono);
+        match read_audio_chunk(reader, &mut chunk_buf)? {
+            AudioReadResult::Eof => break,
+            AudioReadResult::Retry => continue,
+            AudioReadResult::Data(n) => ingest_audio_samples(&mut sample_buf, &chunk_buf, n, gain),
         }
 
-        while sample_buf.len() > 1024 {
-            sample_buf.pop_front();
-        }
-
-        // Transmit frames at ~20 fps (every 50 ms)
-        if last_tick.elapsed() >= Duration::from_millis(45) && sample_buf.len() >= 1024 {
+        if is_music_tick_due(last_tick, sample_buf.len()) {
             last_tick = Instant::now();
 
-            let block: Vec<f32> = sample_buf.iter().copied().collect();
-            plan.compute(&block, &mut mags);
-
-            let band_energies = bands_with_autogain(&mags, 16, 44100.0, &mut autogain);
-            let pairs = bands_to_colors(&band_energies, base_color, mode);
-            let frame = proto::build_slot_frame(&pairs)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
+            let frame = render_music_frame(
+                &sample_buf,
+                &plan,
+                &mut mags,
+                &mut autogain,
+                base_color,
+                mode,
+            )?;
             send_fn(&frame)?;
         }
     }

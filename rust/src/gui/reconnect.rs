@@ -8,7 +8,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::cli::music;
+use crate::cli::music::{self, MusicMode};
 use crate::device;
 use crate::effects::{self, Effect, RGB};
 use crate::gui::worker::{WorkerMessage, WorkerStatus};
@@ -48,6 +48,658 @@ fn render_keys_frame(
         .map_err(|e| format!("Frame build error: {}", e))
 }
 
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+struct PlaybackState {
+    effect: Effect,
+    brightness: f32,
+    keys: Option<Vec<(String, (u8, u8, u8))>>,
+    music: Option<(MusicMode, (u8, u8, u8), f32)>,
+    is_idle: bool,
+}
+
+impl PlaybackState {
+    fn from_initial(initial_cmd: Option<WorkerMessage>) -> Self {
+        match initial_cmd {
+            Some(WorkerMessage::SetColor(rgb)) => Self {
+                effect: Effect::Solid(RGB(rgb.0, rgb.1, rgb.2)),
+                brightness: 1.0,
+                keys: None,
+                music: None,
+                is_idle: false,
+            },
+            Some(WorkerMessage::SetEffect { effect, brightness }) => Self {
+                effect,
+                brightness,
+                keys: None,
+                music: None,
+                is_idle: false,
+            },
+            Some(WorkerMessage::SetKeyFrame(keys)) => Self {
+                effect: Effect::Off,
+                brightness: 1.0,
+                keys: Some(keys),
+                music: None,
+                is_idle: false,
+            },
+            Some(WorkerMessage::SetMusic { mode, color, gain }) => Self {
+                effect: Effect::Off,
+                brightness: 1.0,
+                keys: None,
+                music: Some((mode, color, gain)),
+                is_idle: false,
+            },
+            Some(WorkerMessage::Off) | Some(WorkerMessage::Stop) | None => Self {
+                effect: Effect::Off,
+                brightness: 1.0,
+                keys: None,
+                music: None,
+                is_idle: true,
+            },
+        }
+    }
+
+    fn apply_disconnected_msg(&mut self, msg: WorkerMessage) {
+        match msg {
+            WorkerMessage::Stop | WorkerMessage::Off => {
+                self.is_idle = true;
+                self.music = None;
+                self.keys = None;
+                self.effect = Effect::Off;
+            }
+            WorkerMessage::SetColor(rgb) => {
+                self.is_idle = false;
+                self.music = None;
+                self.keys = None;
+                self.effect = Effect::Solid(RGB(rgb.0, rgb.1, rgb.2));
+                self.brightness = 1.0;
+            }
+            WorkerMessage::SetEffect { effect, brightness } => {
+                self.is_idle = false;
+                self.music = None;
+                self.keys = None;
+                self.effect = effect;
+                self.brightness = brightness;
+            }
+            WorkerMessage::SetKeyFrame(keys) => {
+                self.is_idle = false;
+                self.music = None;
+                self.keys = Some(keys);
+            }
+            WorkerMessage::SetMusic { mode, color, gain } => {
+                self.is_idle = false;
+                self.keys = None;
+                self.music = Some((mode, color, gain));
+            }
+        }
+    }
+}
+
+fn wait_for_reconnect_msg(
+    rx: &Receiver<WorkerMessage>,
+    state: &mut PlaybackState,
+    reconnect_interval: Duration,
+) -> bool {
+    let wait_start = Instant::now();
+    while wait_start.elapsed() < reconnect_interval {
+        let remaining = reconnect_interval.saturating_sub(wait_start.elapsed());
+        let poll_step = remaining.min(Duration::from_millis(50));
+        match rx.recv_timeout(poll_step) {
+            Ok(msg) => state.apply_disconnected_msg(msg),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+    true
+}
+
+fn try_connect_device<R, O, D>(
+    resolve_fn: &mut R,
+    open_fn: &mut O,
+    status_tx: &Sender<WorkerStatus>,
+    reported_connecting: &mut bool,
+    is_idle: bool,
+) -> Option<(PathBuf, D)>
+where
+    R: FnMut() -> Option<PathBuf>,
+    O: FnMut(&PathBuf) -> Result<D, io::Error>,
+{
+    if !*reported_connecting {
+        let _ = status_tx.send(WorkerStatus::Connecting);
+        *reported_connecting = true;
+    }
+    let node = resolve_fn()?;
+    match open_fn(&node) {
+        Ok(dev) => {
+            let status = if is_idle {
+                WorkerStatus::Connected(node.clone())
+            } else {
+                WorkerStatus::Running(node.clone())
+            };
+            let _ = status_tx.send(status);
+            *reported_connecting = false;
+            Some((node, dev))
+        }
+        Err(e) => {
+            let _ = status_tx.send(WorkerStatus::Error(format!(
+                "Failed to open {}: {}",
+                node.display(),
+                e
+            )));
+            None
+        }
+    }
+}
+
+fn ensure_device_connected<R, O, D>(
+    active_device: &mut Option<(PathBuf, D)>,
+    resolve_fn: &mut R,
+    open_fn: &mut O,
+    status_tx: &Sender<WorkerStatus>,
+    reported_connecting: &mut bool,
+    state: &mut PlaybackState,
+    rx: &Receiver<WorkerMessage>,
+    reconnect_interval: Duration,
+    consecutive_failures: &mut usize,
+) -> bool
+where
+    R: FnMut() -> Option<PathBuf>,
+    O: FnMut(&PathBuf) -> Result<D, io::Error>,
+{
+    *active_device = try_connect_device(
+        resolve_fn,
+        open_fn,
+        status_tx,
+        reported_connecting,
+        state.is_idle,
+    );
+    if active_device.is_some() {
+        *consecutive_failures = 0;
+        return true;
+    }
+    wait_for_reconnect_msg(rx, state, reconnect_interval)
+}
+
+fn notify_running_if_active<D>(
+    active_device: &Option<(PathBuf, D)>,
+    status_tx: &Sender<WorkerStatus>,
+) {
+    if let Some((ref node, _)) = active_device {
+        let _ = status_tx.send(WorkerStatus::Running(node.clone()));
+    }
+}
+
+fn notify_idle_if_active<D>(
+    active_device: &Option<(PathBuf, D)>,
+    status_tx: &Sender<WorkerStatus>,
+) {
+    if let Some((ref node, _)) = active_device {
+        let _ = status_tx.send(WorkerStatus::IdleConnected(node.clone()));
+    }
+}
+
+fn send_off_frame_if_active<D, F>(
+    active_device: &mut Option<(PathBuf, D)>,
+    send_fn: &mut F,
+) where
+    F: FnMut(&mut D, &[u8; proto::FRAME_LEN]) -> Result<(), io::Error>,
+{
+    if let Some((_, ref mut dev)) = active_device {
+        if let Ok(off_frame) = proto::build_direct_frame((0, 0, 0)) {
+            let _ = send_fn(dev, &off_frame);
+        }
+    }
+}
+
+fn handle_idle_msg<D, F>(
+    msg: WorkerMessage,
+    state: &mut PlaybackState,
+    active_device: &mut Option<(PathBuf, D)>,
+    status_tx: &Sender<WorkerStatus>,
+    send_fn: &mut F,
+) -> bool
+where
+    F: FnMut(&mut D, &[u8; proto::FRAME_LEN]) -> Result<(), io::Error>,
+{
+    match msg {
+        WorkerMessage::SetColor(rgb) => {
+            state.effect = Effect::Solid(RGB(rgb.0, rgb.1, rgb.2));
+            state.brightness = 1.0;
+            state.keys = None;
+            state.music = None;
+            state.is_idle = false;
+            notify_running_if_active(active_device, status_tx);
+            true
+        }
+        WorkerMessage::SetEffect { effect, brightness } => {
+            state.effect = effect;
+            state.brightness = brightness;
+            state.keys = None;
+            state.music = None;
+            state.is_idle = false;
+            notify_running_if_active(active_device, status_tx);
+            true
+        }
+        WorkerMessage::SetKeyFrame(keys) => {
+            state.keys = Some(keys);
+            state.music = None;
+            state.is_idle = false;
+            notify_running_if_active(active_device, status_tx);
+            true
+        }
+        WorkerMessage::SetMusic { mode, color, gain } => {
+            state.music = Some((mode, color, gain));
+            state.keys = None;
+            state.is_idle = false;
+            notify_running_if_active(active_device, status_tx);
+            true
+        }
+        WorkerMessage::Off => {
+            send_off_frame_if_active(active_device, send_fn);
+            notify_idle_if_active(active_device, status_tx);
+            false
+        }
+        WorkerMessage::Stop => {
+            notify_idle_if_active(active_device, status_tx);
+            false
+        }
+    }
+}
+
+fn check_idle_device_disconnect<R, D>(
+    active_device: &mut Option<(PathBuf, D)>,
+    resolve_fn: &mut R,
+    status_tx: &Sender<WorkerStatus>,
+    reported_connecting: &mut bool,
+) where
+    R: FnMut() -> Option<PathBuf>,
+{
+    if let Some((ref current_node, _)) = active_device {
+        let still_present = match resolve_fn() {
+            Some(ref node) => node == current_node,
+            None => false,
+        };
+        if !still_present {
+            let _ = status_tx.send(WorkerStatus::Disconnected);
+            *active_device = None;
+            *reported_connecting = false;
+        }
+    }
+}
+
+fn wait_in_idle<R, D, F>(
+    rx: &Receiver<WorkerMessage>,
+    status_tx: &Sender<WorkerStatus>,
+    state: &mut PlaybackState,
+    active_device: &mut Option<(PathBuf, D)>,
+    reconnect_interval: Duration,
+    resolve_fn: &mut R,
+    send_fn: &mut F,
+    reported_connecting: &mut bool,
+) -> Result<bool, ()>
+where
+    R: FnMut() -> Option<PathBuf>,
+    F: FnMut(&mut D, &[u8; proto::FRAME_LEN]) -> Result<(), io::Error>,
+{
+    let wait_start = Instant::now();
+    while wait_start.elapsed() < reconnect_interval {
+        let remaining = reconnect_interval.saturating_sub(wait_start.elapsed());
+        let poll_step = remaining.min(Duration::from_millis(50));
+        match rx.recv_timeout(poll_step) {
+            Ok(msg) => {
+                if handle_idle_msg(msg, state, active_device, status_tx, send_fn) {
+                    return Ok(true);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Err(()),
+        }
+    }
+
+    check_idle_device_disconnect(active_device, resolve_fn, status_tx, reported_connecting);
+    Ok(false)
+}
+
+fn set_child_nonblocking(child: &std::process::Child) {
+    if let Some(ref stdout) = child.stdout {
+        let fd = stdout.as_raw_fd();
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+    }
+}
+
+struct MusicAudioPipeline {
+    child: Option<ChildGuard>,
+    sample_buf: std::collections::VecDeque<f32>,
+    mags: Vec<f32>,
+    autogain: music::AutoGain,
+    plan: music::FftPlan,
+}
+
+impl MusicAudioPipeline {
+    fn new() -> Self {
+        Self {
+            child: None,
+            sample_buf: std::collections::VecDeque::with_capacity(2048),
+            mags: vec![0.0f32; 512],
+            autogain: music::AutoGain::new(),
+            plan: music::FftPlan::new(1024),
+        }
+    }
+
+    fn ensure_spawned(&mut self, status_tx: &Sender<WorkerStatus>) -> bool {
+        if self.child.is_some() {
+            return true;
+        }
+        match music::spawn_monitor() {
+            Ok(child) => {
+                set_child_nonblocking(&child);
+                self.child = Some(ChildGuard(child));
+                true
+            }
+            Err(e) => {
+                let _ = status_tx.send(WorkerStatus::Error(e));
+                false
+            }
+        }
+    }
+
+    fn poll_samples(&mut self, gain: f32) -> bool {
+        let guard = match self.child.as_mut() {
+            Some(g) => g,
+            None => return true,
+        };
+        let stdout = match guard.0.stdout.as_mut() {
+            Some(s) => s,
+            None => return true,
+        };
+        read_audio_stream(stdout, &mut self.sample_buf, gain)
+    }
+}
+
+fn append_mono_samples(
+    buf: &mut std::collections::VecDeque<f32>,
+    raw: &[u8],
+    gain: f32,
+) {
+    let num_samples = raw.len() / 4;
+    for i in 0..num_samples {
+        let offset = i * 4;
+        let left = i16::from_le_bytes([raw[offset], raw[offset + 1]]);
+        let right = i16::from_le_bytes([raw[offset + 2], raw[offset + 3]]);
+        let mono = ((left as f32 + right as f32) / (2.0 * 32768.0)) * gain;
+        buf.push_back(mono);
+    }
+    while buf.len() > 1024 {
+        buf.pop_front();
+    }
+}
+
+fn read_audio_stream(
+    stdout: &mut std::process::ChildStdout,
+    sample_buf: &mut std::collections::VecDeque<f32>,
+    gain: f32,
+) -> bool {
+    let mut chunk_buf = [0u8; 8820];
+    loop {
+        match std::io::Read::read(stdout, &mut chunk_buf) {
+            Ok(0) => return false,
+            Ok(n) => append_mono_samples(sample_buf, &chunk_buf[..n], gain),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
+    }
+}
+
+fn poll_music_audio(
+    music: &mut Option<(MusicMode, (u8, u8, u8), f32)>,
+    pipeline: &mut MusicAudioPipeline,
+    status_tx: &Sender<WorkerStatus>,
+) {
+    if let Some((_, _, gain)) = *music {
+        let ok = pipeline.ensure_spawned(status_tx) && pipeline.poll_samples(gain);
+        if !ok {
+            pipeline.child = None;
+            *music = None;
+        }
+    }
+}
+
+fn build_music_frame(
+    mode: MusicMode,
+    color: (u8, u8, u8),
+    pipeline: &mut MusicAudioPipeline,
+    status_tx: &Sender<WorkerStatus>,
+) -> Result<[u8; proto::FRAME_LEN], String> {
+    if pipeline.sample_buf.len() >= 1024 {
+        let block: Vec<f32> = pipeline.sample_buf.iter().copied().collect();
+        pipeline.plan.compute(&block, &mut pipeline.mags);
+        let band_energies =
+            music::bands_with_autogain(&pipeline.mags, 16, 44100.0, &mut pipeline.autogain);
+        let _ = status_tx.send(WorkerStatus::MusicBands(band_energies.clone()));
+        let pairs = music::bands_to_colors(&band_energies, color, mode);
+        proto::build_slot_frame(&pairs).map_err(|e| format!("Frame build error: {}", e))
+    } else {
+        proto::build_direct_frame((0, 0, 0)).map_err(|e| format!("Frame build error: {}", e))
+    }
+}
+
+enum FrameStepError {
+    DropDevice,
+    DropKeys,
+}
+
+fn build_frame_step(
+    state: &PlaybackState,
+    pipeline: &mut MusicAudioPipeline,
+    status_tx: &Sender<WorkerStatus>,
+    t: f64,
+    key_slots: &[u8],
+) -> Result<[u8; proto::FRAME_LEN], FrameStepError> {
+    if let Some((mode, color, _)) = state.music {
+        match build_music_frame(mode, color, pipeline, status_tx) {
+            Ok(f) => Ok(f),
+            Err(e) => {
+                let _ = status_tx.send(WorkerStatus::Error(e));
+                Err(FrameStepError::DropDevice)
+            }
+        }
+    } else if let Some(ref keys) = state.keys {
+        match render_keys_frame(keys) {
+            Ok(f) => Ok(f),
+            Err(e) => {
+                let _ = status_tx.send(WorkerStatus::Error(e));
+                Err(FrameStepError::DropKeys)
+            }
+        }
+    } else {
+        match render_effect_frame(&state.effect, state.brightness, t, key_slots) {
+            Ok(f) => Ok(f),
+            Err(e) => {
+                let _ = status_tx.send(WorkerStatus::Error(e));
+                Err(FrameStepError::DropDevice)
+            }
+        }
+    }
+}
+
+fn handle_transmit_error<S>(
+    e: io::Error,
+    consecutive_failures: &mut usize,
+    status_tx: &Sender<WorkerStatus>,
+    sleep_fn: &mut S,
+) -> bool
+where
+    S: FnMut(Duration),
+{
+    let code = e.raw_os_error();
+    let is_transient = code == Some(libc::EPIPE) || code == Some(libc::ETIMEDOUT);
+    if is_transient {
+        *consecutive_failures += 1;
+        if *consecutive_failures >= 10 {
+            let _ = status_tx.send(WorkerStatus::Error(format!(
+                "Device communication failed after 10 retries: {}",
+                e
+            )));
+            let _ = status_tx.send(WorkerStatus::Disconnected);
+            *consecutive_failures = 0;
+            false
+        } else {
+            let backoff = Duration::from_millis(10 * *consecutive_failures as u64);
+            sleep_fn(backoff);
+            true
+        }
+    } else {
+        let _ = status_tx.send(WorkerStatus::Error(format!(
+            "Device communication error: {}",
+            e
+        )));
+        let _ = status_tx.send(WorkerStatus::Disconnected);
+        *consecutive_failures = 0;
+        false
+    }
+}
+
+fn transmit_frame<D, F, S>(
+    dev: &mut D,
+    frame: &[u8; proto::FRAME_LEN],
+    consecutive_failures: &mut usize,
+    status_tx: &Sender<WorkerStatus>,
+    send_fn: &mut F,
+    sleep_fn: &mut S,
+) -> bool
+where
+    F: FnMut(&mut D, &[u8; proto::FRAME_LEN]) -> Result<(), io::Error>,
+    S: FnMut(Duration),
+{
+    match send_fn(dev, frame) {
+        Ok(()) => {
+            *consecutive_failures = 0;
+            true
+        }
+        Err(e) => handle_transmit_error(e, consecutive_failures, status_tx, sleep_fn),
+    }
+}
+
+fn transmit_frame_if_connected<D, F, S>(
+    active_device: &mut Option<(PathBuf, D)>,
+    frame: &[u8; proto::FRAME_LEN],
+    consecutive_failures: &mut usize,
+    status_tx: &Sender<WorkerStatus>,
+    send_fn: &mut F,
+    sleep_fn: &mut S,
+) where
+    F: FnMut(&mut D, &[u8; proto::FRAME_LEN]) -> Result<(), io::Error>,
+    S: FnMut(Duration),
+{
+    if let Some((_, ref mut dev)) = active_device {
+        if !transmit_frame(dev, frame, consecutive_failures, status_tx, send_fn, sleep_fn) {
+            *active_device = None;
+        }
+    }
+}
+
+fn compute_tick_interval(state: &PlaybackState, keepalive_interval: Duration) -> Duration {
+    if state.music.is_some() {
+        Duration::from_millis(50)
+    } else if state.keys.is_some() {
+        keepalive_interval
+    } else {
+        match state.effect {
+            Effect::Solid(_) => keepalive_interval,
+            _ => Duration::from_millis(40),
+        }
+    }
+}
+
+fn apply_streaming_msg<D, F>(
+    msg: WorkerMessage,
+    state: &mut PlaybackState,
+    pipeline: &mut MusicAudioPipeline,
+    active_device: &mut Option<(PathBuf, D)>,
+    status_tx: &Sender<WorkerStatus>,
+    send_fn: &mut F,
+) where
+    F: FnMut(&mut D, &[u8; proto::FRAME_LEN]) -> Result<(), io::Error>,
+{
+    match msg {
+        WorkerMessage::SetColor(new_color) => {
+            state.music = None;
+            pipeline.child = None;
+            state.keys = None;
+            state.effect = Effect::Solid(RGB(new_color.0, new_color.1, new_color.2));
+            state.brightness = 1.0;
+        }
+        WorkerMessage::SetEffect { effect, brightness } => {
+            state.music = None;
+            pipeline.child = None;
+            state.keys = None;
+            state.effect = effect;
+            state.brightness = brightness;
+        }
+        WorkerMessage::SetKeyFrame(keys) => {
+            state.music = None;
+            pipeline.child = None;
+            state.keys = Some(keys);
+        }
+        WorkerMessage::SetMusic { mode, color, gain } => {
+            state.keys = None;
+            state.music = Some((mode, color, gain));
+        }
+        WorkerMessage::Off => {
+            pipeline.child = None;
+            send_off_frame_if_active(active_device, send_fn);
+            state.is_idle = true;
+            notify_idle_if_active(active_device, status_tx);
+        }
+        WorkerMessage::Stop => {
+            pipeline.child = None;
+            state.is_idle = true;
+            notify_idle_if_active(active_device, status_tx);
+        }
+    }
+}
+
+fn wait_streaming_tick<D, F>(
+    rx: &Receiver<WorkerMessage>,
+    status_tx: &Sender<WorkerStatus>,
+    state: &mut PlaybackState,
+    pipeline: &mut MusicAudioPipeline,
+    active_device: &mut Option<(PathBuf, D)>,
+    tick_interval: Duration,
+    send_fn: &mut F,
+) -> bool
+where
+    F: FnMut(&mut D, &[u8; proto::FRAME_LEN]) -> Result<(), io::Error>,
+{
+    let start = Instant::now();
+    while start.elapsed() < tick_interval {
+        let remaining = tick_interval.saturating_sub(start.elapsed());
+        let poll_step = remaining.min(Duration::from_millis(10));
+        match rx.recv_timeout(poll_step) {
+            Ok(msg) => {
+                apply_streaming_msg(msg, state, pipeline, active_device, status_tx, send_fn);
+                break;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+    true
+}
+
 /// Core reconnecting worker loop that automatically discovers and reopens the device.
 ///
 /// When no device is open (initial startup, unplug, or communication error),
@@ -70,445 +722,96 @@ pub fn run_worker_reconnect_loop<R, O, D, F, S, I>(
     S: FnMut(Duration),
     I: Into<Option<WorkerMessage>>,
 {
-    struct ChildGuard(std::process::Child);
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-
-    let (mut current_effect, mut current_brightness, mut current_keys, mut current_music, mut is_idle) =
-        match initial_cmd.into() {
-            Some(WorkerMessage::SetColor(rgb)) => (
-                Effect::Solid(RGB(rgb.0, rgb.1, rgb.2)),
-                1.0f32,
-                None,
-                None,
-                false,
-            ),
-            Some(WorkerMessage::SetEffect { effect, brightness }) => {
-                (effect, brightness, None, None, false)
-            }
-            Some(WorkerMessage::SetKeyFrame(keys)) => {
-                (Effect::Off, 1.0f32, Some(keys), None, false)
-            }
-            Some(WorkerMessage::SetMusic { mode, color, gain }) => {
-                (Effect::Off, 1.0f32, None, Some((mode, color, gain)), false)
-            }
-            Some(WorkerMessage::Off) => (Effect::Off, 1.0f32, None, None, true),
-            Some(WorkerMessage::Stop) | None => (Effect::Off, 1.0f32, None, None, true),
-        };
-
+    let mut state = PlaybackState::from_initial(initial_cmd.into());
     let mut active_device: Option<(PathBuf, D)> = None;
     let mut reported_connecting = false;
     let mut consecutive_failures = 0;
     let key_slots = proto::all_key_slots();
     let stream_start = Instant::now();
-
-    let mut music_child: Option<ChildGuard> = None;
-    let mut music_sample_buf = std::collections::VecDeque::with_capacity(2048);
-    let mut music_mags = vec![0.0f32; 512];
-    let mut music_autogain = music::AutoGain::new();
-    let music_plan = music::FftPlan::new(1024);
+    let mut pipeline = MusicAudioPipeline::new();
 
     'outer: loop {
         // 1. Device resolution & opening when not connected
         if active_device.is_none() {
-            if !reported_connecting {
-                let _ = status_tx.send(WorkerStatus::Connecting);
-                reported_connecting = true;
+            if !ensure_device_connected(
+                &mut active_device,
+                &mut resolve_fn,
+                &mut open_fn,
+                &status_tx,
+                &mut reported_connecting,
+                &mut state,
+                &rx,
+                reconnect_interval,
+                &mut consecutive_failures,
+            ) {
+                break 'outer;
             }
-
-            if let Some(node) = resolve_fn() {
-                match open_fn(&node) {
-                    Ok(dev) => {
-                        if is_idle {
-                            let _ = status_tx.send(WorkerStatus::Connected(node.clone()));
-                        } else {
-                            let _ = status_tx.send(WorkerStatus::Running(node.clone()));
-                        }
-                        active_device = Some((node, dev));
-                        reported_connecting = false;
-                        consecutive_failures = 0;
-                    }
-                    Err(e) => {
-                        let _ = status_tx.send(WorkerStatus::Error(format!(
-                            "Failed to open {}: {}",
-                            node.display(),
-                            e
-                        )));
-                    }
-                }
-            }
-
             if active_device.is_none() {
-                let wait_start = Instant::now();
-                while wait_start.elapsed() < reconnect_interval {
-                    let remaining = reconnect_interval.saturating_sub(wait_start.elapsed());
-                    let poll_step = remaining.min(Duration::from_millis(50));
-                    match rx.recv_timeout(poll_step) {
-                        Ok(WorkerMessage::Stop) => {
-                            is_idle = true;
-                            current_music = None;
-                            current_keys = None;
-                            current_effect = Effect::Off;
-                        }
-                        Ok(WorkerMessage::Off) => {
-                            is_idle = true;
-                            current_music = None;
-                            current_keys = None;
-                            current_effect = Effect::Off;
-                        }
-                        Ok(WorkerMessage::SetColor(rgb)) => {
-                            is_idle = false;
-                            current_music = None;
-                            current_keys = None;
-                            current_effect = Effect::Solid(RGB(rgb.0, rgb.1, rgb.2));
-                            current_brightness = 1.0;
-                        }
-                        Ok(WorkerMessage::SetEffect { effect, brightness }) => {
-                            is_idle = false;
-                            current_music = None;
-                            current_keys = None;
-                            current_effect = effect;
-                            current_brightness = brightness;
-                        }
-                        Ok(WorkerMessage::SetKeyFrame(keys)) => {
-                            is_idle = false;
-                            current_music = None;
-                            current_keys = Some(keys);
-                        }
-                        Ok(WorkerMessage::SetMusic { mode, color, gain }) => {
-                            is_idle = false;
-                            current_keys = None;
-                            current_music = Some((mode, color, gain));
-                        }
-                        Err(RecvTimeoutError::Timeout) => {}
-                        Err(RecvTimeoutError::Disconnected) => {
-                            break 'outer;
-                        }
-                    }
-                }
                 continue 'outer;
             }
         }
 
-        // 2. If in idle/connect-only mode, send NO frames and wait for commands or device disconnect
-        if is_idle {
-            let wait_start = Instant::now();
-            while wait_start.elapsed() < reconnect_interval {
-                let remaining = reconnect_interval.saturating_sub(wait_start.elapsed());
-                let poll_step = remaining.min(Duration::from_millis(50));
-                match rx.recv_timeout(poll_step) {
-                    Ok(WorkerMessage::SetColor(rgb)) => {
-                        is_idle = false;
-                        current_music = None;
-                        current_keys = None;
-                        current_effect = Effect::Solid(RGB(rgb.0, rgb.1, rgb.2));
-                        current_brightness = 1.0;
-                        if let Some((ref node, _)) = active_device {
-                            let _ = status_tx.send(WorkerStatus::Running(node.clone()));
-                        }
-                        continue 'outer;
-                    }
-                    Ok(WorkerMessage::SetEffect { effect, brightness }) => {
-                        is_idle = false;
-                        current_music = None;
-                        current_keys = None;
-                        current_effect = effect;
-                        current_brightness = brightness;
-                        if let Some((ref node, _)) = active_device {
-                            let _ = status_tx.send(WorkerStatus::Running(node.clone()));
-                        }
-                        continue 'outer;
-                    }
-                    Ok(WorkerMessage::SetKeyFrame(keys)) => {
-                        is_idle = false;
-                        current_music = None;
-                        current_keys = Some(keys);
-                        if let Some((ref node, _)) = active_device {
-                            let _ = status_tx.send(WorkerStatus::Running(node.clone()));
-                        }
-                        continue 'outer;
-                    }
-                    Ok(WorkerMessage::SetMusic { mode, color, gain }) => {
-                        is_idle = false;
-                        current_keys = None;
-                        current_music = Some((mode, color, gain));
-                        if let Some((ref node, _)) = active_device {
-                            let _ = status_tx.send(WorkerStatus::Running(node.clone()));
-                        }
-                        continue 'outer;
-                    }
-                    Ok(WorkerMessage::Off) => {
-                        if let Some((_, ref mut dev)) = active_device {
-                            if let Ok(off_frame) = proto::build_direct_frame((0, 0, 0)) {
-                                let _ = send_fn(dev, &off_frame);
-                            }
-                        }
-                        if let Some((ref node, _)) = active_device {
-                            let _ = status_tx.send(WorkerStatus::IdleConnected(node.clone()));
-                        }
-                    }
-                    Ok(WorkerMessage::Stop) => {
-                        if let Some((ref node, _)) = active_device {
-                            let _ = status_tx.send(WorkerStatus::IdleConnected(node.clone()));
-                        }
-                    }
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => {
-                        break 'outer;
-                    }
-                }
+        // 2. Idle / connect-only mode
+        if state.is_idle {
+            match wait_in_idle(
+                &rx,
+                &status_tx,
+                &mut state,
+                &mut active_device,
+                reconnect_interval,
+                &mut resolve_fn,
+                &mut send_fn,
+                &mut reported_connecting,
+            ) {
+                Ok(_) => continue 'outer,
+                Err(()) => break 'outer,
             }
-
-            // Check if device is still connected
-            if let Some((ref current_node, _)) = active_device {
-                let still_present = match resolve_fn() {
-                    Some(ref node) => node == current_node,
-                    None => false,
-                };
-                if !still_present {
-                    let _ = status_tx.send(WorkerStatus::Disconnected);
-                    active_device = None;
-                    reported_connecting = false;
-                }
-            }
-            continue 'outer;
         }
 
         let t = stream_start.elapsed().as_secs_f64();
 
         // 3. Audio monitor child process for music mode
-        if let Some((_, _, gain)) = current_music {
-            if music_child.is_none() {
-                match music::spawn_monitor() {
-                    Ok(child) => {
-                        if let Some(ref stdout) = child.stdout {
-                            let fd = stdout.as_raw_fd();
-                            unsafe {
-                                let flags = libc::fcntl(fd, libc::F_GETFL, 0);
-                                if flags >= 0 {
-                                    libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                                }
-                            }
-                        }
-                        music_child = Some(ChildGuard(child));
-                    }
-                    Err(e) => {
-                        let _ = status_tx.send(WorkerStatus::Error(e));
-                        current_music = None;
-                    }
-                }
-            }
-
-            // Non-blocking read of available audio samples
-            let mut read_failed = false;
-            if let Some(ref mut guard) = music_child {
-                if let Some(ref mut stdout) = guard.0.stdout {
-                    let mut chunk_buf = [0u8; 8820];
-                    loop {
-                        match std::io::Read::read(stdout, &mut chunk_buf) {
-                            Ok(0) => {
-                                read_failed = true;
-                                break;
-                            }
-                            Ok(n) => {
-                                let num_samples = n / 4;
-                                for i in 0..num_samples {
-                                    let offset = i * 4;
-                                    let left = i16::from_le_bytes([chunk_buf[offset], chunk_buf[offset + 1]]);
-                                    let right = i16::from_le_bytes([chunk_buf[offset + 2], chunk_buf[offset + 3]]);
-                                    let mono = ((left as f32 + right as f32) / (2.0 * 32768.0)) * gain;
-                                    music_sample_buf.push_back(mono);
-                                }
-                                while music_sample_buf.len() > 1024 {
-                                    music_sample_buf.pop_front();
-                                }
-                            }
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                break;
-                            }
-                            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                                continue;
-                            }
-                            Err(_) => {
-                                read_failed = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if read_failed {
-                music_child = None;
-                current_music = None;
-            }
-        }
+        poll_music_audio(&mut state.music, &mut pipeline, &status_tx);
 
         // 4. Build RGB frame
-        let frame = if let Some((mode, color, _)) = current_music {
-            if music_sample_buf.len() >= 1024 {
-                let block: Vec<f32> = music_sample_buf.iter().copied().collect();
-                music_plan.compute(&block, &mut music_mags);
-                let band_energies =
-                    music::bands_with_autogain(&music_mags, 16, 44100.0, &mut music_autogain);
-                let _ = status_tx.send(WorkerStatus::MusicBands(band_energies.clone()));
-                let pairs = music::bands_to_colors(&band_energies, color, mode);
-                match proto::build_slot_frame(&pairs) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        let _ = status_tx
-                            .send(WorkerStatus::Error(format!("Frame build error: {}", e)));
-                        active_device = None;
-                        continue 'outer;
-                    }
-                }
-            } else {
-                match proto::build_direct_frame((0, 0, 0)) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        let _ = status_tx
-                            .send(WorkerStatus::Error(format!("Frame build error: {}", e)));
-                        active_device = None;
-                        continue 'outer;
-                    }
-                }
+        let frame = match build_frame_step(&state, &mut pipeline, &status_tx, t, &key_slots) {
+            Ok(f) => f,
+            Err(FrameStepError::DropDevice) => {
+                active_device = None;
+                continue 'outer;
             }
-        } else if let Some(ref keys) = current_keys {
-            match render_keys_frame(keys) {
-                Ok(f) => f,
-                Err(e) => {
-                    let _ = status_tx.send(WorkerStatus::Error(e));
-                    current_keys = None;
-                    continue 'outer;
-                }
-            }
-        } else {
-            match render_effect_frame(&current_effect, current_brightness, t, &key_slots) {
-                Ok(f) => f,
-                Err(e) => {
-                    let _ = status_tx.send(WorkerStatus::Error(e));
-                    active_device = None;
-                    continue 'outer;
-                }
+            Err(FrameStepError::DropKeys) => {
+                state.keys = None;
+                continue 'outer;
             }
         };
 
         // 5. Transmit frame to open device
-        if let Some((_, ref mut dev)) = active_device {
-            match send_fn(dev, &frame) {
-                Ok(()) => {
-                    consecutive_failures = 0;
-                }
-                Err(e) => {
-                    let code = e.raw_os_error();
-                    let is_transient = code == Some(libc::EPIPE) || code == Some(libc::ETIMEDOUT);
-                    if is_transient {
-                        consecutive_failures += 1;
-                        if consecutive_failures >= 10 {
-                            let _ = status_tx.send(WorkerStatus::Error(format!(
-                                "Device communication failed after 10 retries: {}",
-                                e
-                            )));
-                            let _ = status_tx.send(WorkerStatus::Disconnected);
-                            // Close device handle and transition to reconnecting
-                            active_device = None;
-                            consecutive_failures = 0;
-                        } else {
-                            let backoff = Duration::from_millis(10 * consecutive_failures as u64);
-                            sleep_fn(backoff);
-                        }
-                    } else {
-                        let _ = status_tx.send(WorkerStatus::Error(format!(
-                            "Device communication error: {}",
-                            e
-                        )));
-                        let _ = status_tx.send(WorkerStatus::Disconnected);
-                        // Fatal error (e.g. ENODEV on unplug): close and reconnect
-                        active_device = None;
-                        consecutive_failures = 0;
-                    }
-                }
-            }
-        }
+        transmit_frame_if_connected(
+            &mut active_device,
+            &frame,
+            &mut consecutive_failures,
+            &status_tx,
+            &mut send_fn,
+            &mut sleep_fn,
+        );
 
         // 6. Calculate tick interval and process channel messages
-        let tick_interval = if current_music.is_some() {
-            Duration::from_millis(50)
-        } else if current_keys.is_some() {
-            keepalive_interval
-        } else {
-            match current_effect {
-                Effect::Solid(_) => keepalive_interval,
-                _ => Duration::from_millis(40),
-            }
-        };
-
-        let start = Instant::now();
-        while start.elapsed() < tick_interval {
-            let remaining = tick_interval.saturating_sub(start.elapsed());
-            let poll_step = remaining.min(Duration::from_millis(10));
-            match rx.recv_timeout(poll_step) {
-                Ok(WorkerMessage::SetColor(new_color)) => {
-                    current_music = None;
-                    music_child = None;
-                    current_keys = None;
-                    current_effect = Effect::Solid(RGB(new_color.0, new_color.1, new_color.2));
-                    current_brightness = 1.0;
-                    break;
-                }
-                Ok(WorkerMessage::SetEffect { effect, brightness }) => {
-                    current_music = None;
-                    music_child = None;
-                    current_keys = None;
-                    current_effect = effect;
-                    current_brightness = brightness;
-                    break;
-                }
-                Ok(WorkerMessage::SetKeyFrame(keys)) => {
-                    current_music = None;
-                    music_child = None;
-                    current_keys = Some(keys);
-                    break;
-                }
-                Ok(WorkerMessage::SetMusic { mode, color, gain }) => {
-                    current_keys = None;
-                    current_music = Some((mode, color, gain));
-                    break;
-                }
-                Ok(WorkerMessage::Off) => {
-                    music_child = None;
-                    if let Some((_, ref mut dev)) = active_device {
-                        if let Ok(off_frame) = proto::build_direct_frame((0, 0, 0)) {
-                            let _ = send_fn(dev, &off_frame);
-                        }
-                    }
-                    is_idle = true;
-                    if let Some((ref node, _)) = active_device {
-                        let _ = status_tx.send(WorkerStatus::IdleConnected(node.clone()));
-                    }
-                    break;
-                }
-                Ok(WorkerMessage::Stop) => {
-                    music_child = None;
-                    is_idle = true;
-                    if let Some((ref node, _)) = active_device {
-                        let _ = status_tx.send(WorkerStatus::IdleConnected(node.clone()));
-                    }
-                    break;
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    break 'outer;
-                }
-            }
+        let tick_interval = compute_tick_interval(&state, keepalive_interval);
+        if !wait_streaming_tick(
+            &rx,
+            &status_tx,
+            &mut state,
+            &mut pipeline,
+            &mut active_device,
+            tick_interval,
+            &mut send_fn,
+        ) {
+            break 'outer;
         }
     }
 
-    drop(music_child);
+    drop(pipeline.child);
     drop(active_device);
     let _ = status_tx.send(WorkerStatus::Stopped);
 }

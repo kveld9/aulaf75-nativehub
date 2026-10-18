@@ -28,6 +28,69 @@ pub fn cmd_list(devices: &[DeviceInfo]) -> i32 {
     0
 }
 
+fn device_matches_filters(
+    d: &DeviceInfo,
+    path: Option<&str>,
+    vid: Option<u16>,
+    pid: Option<u16>,
+) -> bool {
+    let path_ok = path.map_or(true, |p| d.path.to_string_lossy() == p);
+    let vid_ok = vid.map_or(true, |v| d.vendor_id == v);
+    let pid_ok = pid.map_or(true, |pi| d.product_id == pi);
+    path_ok && vid_ok && pid_ok
+}
+
+fn filter_devices<'a>(
+    devices: &'a [DeviceInfo],
+    path: Option<&str>,
+    vid: Option<u16>,
+    pid: Option<u16>,
+) -> Vec<&'a DeviceInfo> {
+    if path.is_some() || vid.is_some() || pid.is_some() {
+        devices
+            .iter()
+            .filter(|d| device_matches_filters(d, path, vid, pid))
+            .collect()
+    } else {
+        devices.iter().filter(|d| d.is_known).collect()
+    }
+}
+
+fn fallback_str<'a>(val: &'a str, fallback: &'static str) -> &'a str {
+    if val.is_empty() {
+        fallback
+    } else {
+        val
+    }
+}
+
+fn print_device_info(idx: usize, dev: &DeviceInfo) {
+    let status_label = if dev.is_known {
+        "Known AULA Device"
+    } else {
+        "Unknown Device"
+    };
+    println!("Device #{} ({}):", idx + 1, status_label);
+    println!("  Device Name:   {}", dev.device_name);
+    println!("  Vendor ID:     0x{:04x}", dev.vendor_id);
+    println!("  Product ID:    0x{:04x}", dev.product_id);
+    println!("  Path:          {}", dev.path.display());
+    println!(
+        "  Interface:     {}",
+        dev.interface_number
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "N/A".to_string())
+    );
+    println!("  Manufacturer:  {}", dev.manufacturer_string);
+    println!("  Product:       {}", dev.product_string);
+    println!("  Release:       0x{:04x}", dev.release_number);
+    println!("  Usage Page:    0x{:04x}", dev.usage_page);
+    println!("  Usage:         0x{:04x}", dev.usage);
+    println!("  USB Parent:    {}", fallback_str(&dev.usb_parent, "N/A"));
+    println!("  Phys:          {}", fallback_str(&dev.phys, "N/A"));
+    println!("  Connection:    {:?}", dev.classify_connection());
+}
+
 /// Print details of matching AULA device.
 pub fn cmd_info(
     devices: &[DeviceInfo],
@@ -35,31 +98,7 @@ pub fn cmd_info(
     vid: Option<u16>,
     pid: Option<u16>,
 ) -> i32 {
-    let matched: Vec<&DeviceInfo> = if path.is_some() || vid.is_some() || pid.is_some() {
-        devices
-            .iter()
-            .filter(|d| {
-                if let Some(p) = path {
-                    if d.path.to_string_lossy() != p {
-                        return false;
-                    }
-                }
-                if let Some(v) = vid {
-                    if d.vendor_id != v {
-                        return false;
-                    }
-                }
-                if let Some(pi) = pid {
-                    if d.product_id != pi {
-                        return false;
-                    }
-                }
-                true
-            })
-            .collect()
-    } else {
-        devices.iter().filter(|d| d.is_known).collect()
-    };
+    let matched = filter_devices(devices, path, vid, pid);
 
     if matched.is_empty() {
         println!("No matching device found.");
@@ -67,44 +106,7 @@ pub fn cmd_info(
     }
 
     for (idx, dev) in matched.iter().enumerate() {
-        let status_label = if dev.is_known {
-            "Known AULA Device"
-        } else {
-            "Unknown Device"
-        };
-        println!("Device #{} ({}):", idx + 1, status_label);
-        println!("  Device Name:   {}", dev.device_name);
-        println!("  Vendor ID:     0x{:04x}", dev.vendor_id);
-        println!("  Product ID:    0x{:04x}", dev.product_id);
-        println!("  Path:          {}", dev.path.display());
-        println!(
-            "  Interface:     {}",
-            dev.interface_number
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "N/A".to_string())
-        );
-        println!("  Manufacturer:  {}", dev.manufacturer_string);
-        println!("  Product:       {}", dev.product_string);
-        println!("  Release:       0x{:04x}", dev.release_number);
-        println!("  Usage Page:    0x{:04x}", dev.usage_page);
-        println!("  Usage:         0x{:04x}", dev.usage);
-        println!(
-            "  USB Parent:    {}",
-            if dev.usb_parent.is_empty() {
-                "N/A"
-            } else {
-                &dev.usb_parent
-            }
-        );
-        println!(
-            "  Phys:          {}",
-            if dev.phys.is_empty() {
-                "N/A"
-            } else {
-                &dev.phys
-            }
-        );
-        println!("  Connection:    {:?}", dev.classify_connection());
+        print_device_info(idx, dev);
     }
 
     0

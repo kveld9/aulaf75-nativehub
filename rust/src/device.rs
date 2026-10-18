@@ -60,16 +60,10 @@ pub fn resolve_control_node() -> Option<PathBuf> {
 ///    This strictly excludes PCI components (multiple colons: `0000:00:08.1`),
 ///    HID child components (`0003:258A:010C.0008`), and interface 0 (`5-2:1.0`).
 /// 4. Confirms parent USB device `idVendor` and `idProduct` equal expected `vid` and `pid`.
-pub fn resolve_control_node_with_roots(
-    sys_class_hidraw: &Path,
-    usb_devices: &Path,
-    vid: u16,
-    pid: u16,
-) -> Option<PathBuf> {
+fn get_sorted_hidraw_entries(sys_class_hidraw: &Path) -> Option<Vec<PathBuf>> {
     if !sys_class_hidraw.is_dir() {
         return None;
     }
-
     let read_dir = fs::read_dir(sys_class_hidraw).ok()?;
     let mut entries: Vec<PathBuf> = Vec::new();
     for entry in read_dir.flatten() {
@@ -79,100 +73,116 @@ pub fn resolve_control_node_with_roots(
             entries.push(entry.path());
         }
     }
-
-    // Sort numerically by hidraw index (hidraw0, hidraw1, ...)
     entries.sort_by_key(|p| {
         let s = p.file_name().unwrap_or_default().to_string_lossy();
         s.strip_prefix("hidraw")
             .and_then(|num| num.parse::<u32>().ok())
             .unwrap_or(u32::MAX)
     });
+    Some(entries)
+}
+
+fn is_control_interface_comp(comp: &str) -> bool {
+    if comp.matches(':').count() != 1 {
+        return false;
+    }
+    match comp.split_once(':') {
+        Some((_, after)) => after.starts_with("1.") && after.ends_with(".1"),
+        None => false,
+    }
+}
+
+fn find_control_iface_index(parts: &[String]) -> Option<usize> {
+    parts.iter().position(|comp| is_control_interface_comp(comp))
+}
+
+fn collect_candidate_usb_dirs(
+    real_path: &Path,
+    parts: &[String],
+    iface_idx: usize,
+    usb_devices: &Path,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let parent_dir: PathBuf = real_path.components().take(iface_idx).collect();
+    candidates.push(parent_dir);
+
+    if usb_devices.is_dir() {
+        let usb_dev_name = parts[iface_idx].split(':').next().unwrap_or("");
+        candidates.push(usb_devices.join(usb_dev_name));
+    }
+
+    let mut curr = real_path.parent();
+    for _ in 0..4 {
+        let p = match curr {
+            Some(p) => p,
+            None => break,
+        };
+        let pb = p.to_path_buf();
+        if !candidates.contains(&pb) {
+            candidates.push(pb);
+        }
+        curr = p.parent();
+    }
+    candidates
+}
+
+fn read_sysfs_string(dir: &Path, file_name: &str) -> Option<String> {
+    let s = fs::read_to_string(dir.join(file_name)).ok()?;
+    Some(s.trim().to_string())
+}
+
+fn read_sysfs_hex_u16(dir: &Path, file_name: &str) -> Option<u16> {
+    let s = fs::read_to_string(dir.join(file_name)).ok()?;
+    u16::from_str_radix(s.trim(), 16).ok()
+}
+
+fn candidate_matches_vid_pid(candidate: &Path, vid: u16, pid: u16) -> bool {
+    let read_vid = read_sysfs_hex_u16(candidate, "idVendor");
+    let read_pid = read_sysfs_hex_u16(candidate, "idProduct");
+    read_vid == Some(vid) && read_pid == Some(pid)
+}
+
+fn check_hidraw_control_node(entry: &Path, usb_devices: &Path, vid: u16, pid: u16) -> bool {
+    let dev_link = entry.join("device");
+    let real_path = match fs::canonicalize(&dev_link) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    let parts: Vec<String> = real_path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+
+    let iface_idx = match find_control_iface_index(&parts) {
+        Some(idx) => idx,
+        None => return false,
+    };
+
+    let candidates = collect_candidate_usb_dirs(&real_path, &parts, iface_idx, usb_devices);
+    candidates.iter().any(|c| candidate_matches_vid_pid(c, vid, pid))
+}
+
+/// Resolve the control node with injectable sysfs base directories and target VID/PID.
+///
+/// Hardware predicate:
+/// 1. Scans `sys_class_hidraw` entries numerically (`hidraw0`, `hidraw1`, ...).
+/// 2. Resolves real path of `<entry>/device`.
+/// 3. Selects the component with exactly one colon whose post-colon part starts with "1."
+///    and ends with ".1" (e.g. `5-2:1.1`, matching USB configuration 1, interface 1).
+///    This strictly excludes PCI components (multiple colons: `0000:00:08.1`),
+///    HID child components (`0003:258A:010C.0008`), and interface 0 (`5-2:1.0`).
+/// 4. Confirms parent USB device `idVendor` and `idProduct` equal expected `vid` and `pid`.
+pub fn resolve_control_node_with_roots(
+    sys_class_hidraw: &Path,
+    usb_devices: &Path,
+    vid: u16,
+    pid: u16,
+) -> Option<PathBuf> {
+    let entries = get_sorted_hidraw_entries(sys_class_hidraw)?;
 
     for entry in entries {
-        let dev_link = entry.join("device");
-        if !dev_link.exists() {
-            continue;
-        }
-
-        let real_path = match fs::canonicalize(&dev_link) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        let parts: Vec<String> = real_path
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect();
-
-        // Identify interface component with exactly one colon, starting with "1." and ending with ".1"
-        let mut iface_idx = None;
-        for (idx, comp) in parts.iter().enumerate() {
-            if comp.matches(':').count() == 1 {
-                if let Some((_, after_colon)) = comp.split_once(':') {
-                    if after_colon.starts_with("1.") && after_colon.ends_with(".1") {
-                        iface_idx = Some(idx);
-                        break;
-                    }
-                }
-            }
-        }
-
-        let iface_idx = match iface_idx {
-            Some(i) => i,
-            None => continue,
-        };
-
-        let iface_comp = &parts[iface_idx];
-        let usb_dev_name = iface_comp.split(':').next().unwrap_or("");
-
-        let mut candidate_dirs: Vec<PathBuf> = Vec::new();
-
-        // 1. Immediate parent directory of interface component in real_path
-        let parent_dir: PathBuf = real_path.components().take(iface_idx).collect();
-        candidate_dirs.push(parent_dir);
-
-        // 2. usb_devices symlink/directory for the device
-        if usb_devices.is_dir() {
-            candidate_dirs.push(usb_devices.join(usb_dev_name));
-        }
-
-        // 3. Ancestors in real_path hierarchy
-        let mut curr = real_path.parent();
-        for _ in 0..4 {
-            if let Some(p) = curr {
-                let pb = p.to_path_buf();
-                if !candidate_dirs.contains(&pb) {
-                    candidate_dirs.push(pb);
-                }
-                curr = p.parent();
-            } else {
-                break;
-            }
-        }
-
-        let mut matched = false;
-        for candidate in candidate_dirs {
-            let vendor_file = candidate.join("idVendor");
-            let product_file = candidate.join("idProduct");
-            if vendor_file.is_file() && product_file.is_file() {
-                if let (Ok(v_str), Ok(p_str)) = (
-                    fs::read_to_string(&vendor_file),
-                    fs::read_to_string(&product_file),
-                ) {
-                    if let (Ok(read_vid), Ok(read_pid)) = (
-                        u16::from_str_radix(v_str.trim(), 16),
-                        u16::from_str_radix(p_str.trim(), 16),
-                    ) {
-                        if read_vid == vid && read_pid == pid {
-                            matched = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        if matched {
+        if check_hidraw_control_node(&entry, usb_devices, vid, pid) {
             let entry_name = entry.file_name().unwrap_or_default().to_string_lossy();
             return Some(PathBuf::from(format!("/dev/{}", entry_name)));
         }
@@ -181,206 +191,254 @@ pub fn resolve_control_node_with_roots(
     None
 }
 
-/// Enumerate HID device nodes from sysfs and parse device attributes.
-pub fn enumerate_devices(sys_class_hidraw: &Path) -> Vec<DeviceInfo> {
-    let mut results = Vec::new();
-    if !sys_class_hidraw.is_dir() {
-        return results;
+fn parse_hid_id_line(val: &str) -> (u16, u16) {
+    let sub: Vec<&str> = val.split(':').collect();
+    if sub.len() < 3 {
+        return (0, 0);
+    }
+    let vid = u16::from_str_radix(sub[1], 16).unwrap_or(0);
+    let pid = u16::from_str_radix(sub[2], 16).unwrap_or(0);
+    (vid, pid)
+}
+
+fn parse_uevent_line(
+    line: &str,
+    vendor_id: &mut u16,
+    product_id: &mut u16,
+    product_string: &mut String,
+    phys: &mut String,
+) {
+    if let Some(val) = line.strip_prefix("HID_ID=") {
+        let (v, p) = parse_hid_id_line(val);
+        if v != 0 {
+            *vendor_id = v;
+        }
+        if p != 0 {
+            *product_id = p;
+        }
+    } else if let Some(val) = line.strip_prefix("HID_NAME=") {
+        *product_string = val.trim().to_string();
+    } else if let Some(val) = line.strip_prefix("HID_PHYS=") {
+        *phys = val.trim().to_string();
+    }
+}
+
+fn read_fallback_phys(dev_dir: &Path, phys: &mut String) {
+    if phys.is_empty() {
+        if let Ok(s) = fs::read_to_string(dev_dir.join("phys")) {
+            *phys = s.trim().to_string();
+        }
+    }
+}
+
+fn parse_uevent(dev_dir: &Path) -> (u16, u16, String, String) {
+    let mut vendor_id = 0;
+    let mut product_id = 0;
+    let mut product_string = String::new();
+    let mut phys = String::new();
+
+    let uevent_file = dev_dir.join("uevent");
+    if let Ok(content) = fs::read_to_string(&uevent_file) {
+        for line in content.lines() {
+            parse_uevent_line(line, &mut vendor_id, &mut product_id, &mut product_string, &mut phys);
+        }
     }
 
-    let read_dir = match fs::read_dir(sys_class_hidraw) {
-        Ok(r) => r,
-        Err(_) => return results,
+    read_fallback_phys(dev_dir, &mut phys);
+    (vendor_id, product_id, product_string, phys)
+}
+
+fn is_usb_interface_pattern(comp: &str) -> bool {
+    if comp.matches(':').count() != 1 {
+        return false;
+    }
+    match comp.split_once(':') {
+        Some((_, after)) => after.starts_with("1.") && after.contains('.'),
+        None => false,
+    }
+}
+
+fn find_usb_interface_component_index(parts: &[String]) -> Option<usize> {
+    let mut iface_idx = None;
+    for (idx, comp) in parts.iter().enumerate() {
+        if is_usb_interface_pattern(comp) {
+            iface_idx = Some(idx);
+        }
+    }
+    iface_idx
+}
+
+fn extract_usb_parent_from_parts(parts: &[String], idx: usize) -> String {
+    if idx > 0 {
+        parts[idx - 1].clone()
+    } else {
+        parts[idx]
+            .split_once(':')
+            .map(|(before, _)| before.to_string())
+            .unwrap_or_default()
+    }
+}
+
+fn read_b_interface_number(parent: &Path) -> Option<i32> {
+    let s = fs::read_to_string(parent.join("bInterfaceNumber")).ok()?;
+    s.trim().parse::<i32>().ok()
+}
+
+fn parse_interface_from_comp(comp: &str) -> Option<i32> {
+    if comp.matches(':').count() != 1 {
+        return None;
+    }
+    let (_, after) = comp.split_once(':')?;
+    let (_, iface_str) = after.split_once('.')?;
+    iface_str.parse::<i32>().ok()
+}
+
+fn fallback_interface_from_path(rp: &Path) -> Option<i32> {
+    for comp in rp.components() {
+        let s = comp.as_os_str().to_string_lossy();
+        if let Some(num) = parse_interface_from_comp(&s) {
+            return Some(num);
+        }
+    }
+    None
+}
+
+fn discover_interface_and_parent(rp: &Path) -> (Option<i32>, String) {
+    let parts: Vec<String> = rp
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+
+    let mut usb_parent = find_usb_interface_component_index(&parts)
+        .map(|idx| extract_usb_parent_from_parts(&parts, idx))
+        .unwrap_or_default();
+
+    let mut interface_number = None;
+    if let Some(parent) = rp.parent() {
+        interface_number = read_b_interface_number(parent);
+        if usb_parent.is_empty() {
+            if let Some(gp) = parent.parent() {
+                usb_parent = gp.file_name().unwrap_or_default().to_string_lossy().to_string();
+            }
+        }
+    }
+
+    if interface_number.is_none() {
+        interface_number = fallback_interface_from_path(rp);
+    }
+
+    (interface_number, usb_parent)
+}
+
+struct AncestorUsbInfo {
+    manufacturer: String,
+    product: String,
+    release: u16,
+    vendor_id: u16,
+    product_id: u16,
+}
+
+fn update_if_empty(target: &mut String, dir: &Path, file: &str) {
+    if target.is_empty() {
+        if let Some(s) = read_sysfs_string(dir, file) {
+            *target = s;
+        }
+    }
+}
+
+fn update_if_zero(target: &mut u16, dir: &Path, file: &str) {
+    if *target == 0 {
+        if let Some(v) = read_sysfs_hex_u16(dir, file) {
+            *target = v;
+        }
+    }
+}
+
+fn populate_ancestor_dir(info: &mut AncestorUsbInfo, p: &Path) {
+    update_if_empty(&mut info.manufacturer, p, "manufacturer");
+    update_if_empty(&mut info.product, p, "product");
+    update_if_zero(&mut info.release, p, "bcdDevice");
+    update_if_zero(&mut info.vendor_id, p, "idVendor");
+    update_if_zero(&mut info.product_id, p, "idProduct");
+}
+
+fn discover_ancestor_usb_info(
+    rp: &Path,
+    vendor_id: u16,
+    product_id: u16,
+    product: String,
+) -> AncestorUsbInfo {
+    let mut info = AncestorUsbInfo {
+        manufacturer: String::new(),
+        product,
+        release: 0,
+        vendor_id,
+        product_id,
+    };
+    let mut curr = rp.parent();
+    for _ in 0..4 {
+        let p = match curr {
+            Some(p) => p,
+            None => break,
+        };
+        populate_ancestor_dir(&mut info, p);
+        curr = p.parent();
+    }
+    info
+}
+
+fn build_device_info(entry: &Path) -> DeviceInfo {
+    let entry_name = entry.file_name().unwrap_or_default().to_string_lossy();
+    let dev_path = PathBuf::from(format!("/dev/{}", entry_name));
+    let dev_dir = entry.join("device");
+    let (mut vid, mut pid, prod_str, phys) = parse_uevent(&dev_dir);
+
+    let real_path = fs::canonicalize(&dev_dir).ok();
+    let (interface_number, usb_parent) = real_path
+        .as_deref()
+        .map(discover_interface_and_parent)
+        .unwrap_or_default();
+
+    let (mfg_str, prod_str, release) = if let Some(ref rp) = real_path {
+        let anc = discover_ancestor_usb_info(rp, vid, pid, prod_str);
+        vid = anc.vendor_id;
+        pid = anc.product_id;
+        (anc.manufacturer, anc.product, anc.release)
+    } else {
+        (String::new(), prod_str, 0)
     };
 
-    let mut entries: Vec<PathBuf> = Vec::new();
-    for entry in read_dir.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if name_str.starts_with("hidraw") {
-            entries.push(entry.path());
-        }
+    let is_known = vid == KNOWN_VID && pid == KNOWN_PID;
+    let device_name = if is_known {
+        "AULA F75".to_string()
+    } else {
+        "Unknown".to_string()
+    };
+
+    DeviceInfo {
+        vendor_id: vid,
+        product_id: pid,
+        path: dev_path,
+        interface_number,
+        manufacturer_string: mfg_str,
+        product_string: prod_str,
+        release_number: release,
+        usage_page: 0,
+        usage: 0,
+        is_known,
+        device_name,
+        usb_parent,
+        phys,
     }
+}
 
-    entries.sort_by_key(|p| {
-        let s = p.file_name().unwrap_or_default().to_string_lossy();
-        s.strip_prefix("hidraw")
-            .and_then(|num| num.parse::<u32>().ok())
-            .unwrap_or(u32::MAX)
-    });
-
-    for entry in entries {
-        let entry_name = entry.file_name().unwrap_or_default().to_string_lossy();
-        let dev_path = PathBuf::from(format!("/dev/{}", entry_name));
-
-        let mut vendor_id: u16 = 0;
-        let mut product_id: u16 = 0;
-        let mut product_string = String::new();
-        let mut manufacturer_string = String::new();
-        let mut interface_number: Option<i32> = None;
-        let mut release_number: u16 = 0;
-        let mut usb_parent = String::new();
-        let mut phys = String::new();
-
-        let dev_dir = entry.join("device");
-        let real_path = fs::canonicalize(&dev_dir).ok();
-
-        // 1. Try reading uevent from device directory
-        let uevent_file = dev_dir.join("uevent");
-        if let Ok(content) = fs::read_to_string(&uevent_file) {
-            for line in content.lines() {
-                if let Some(val) = line.strip_prefix("HID_ID=") {
-                    // Format: BUS:VENDOR:PRODUCT (e.g. 0003:0000258A:0000010C)
-                    let sub: Vec<&str> = val.split(':').collect();
-                    if sub.len() >= 3 {
-                        if let Ok(v) = u16::from_str_radix(sub[1], 16) {
-                            vendor_id = v;
-                        }
-                        if let Ok(p) = u16::from_str_radix(sub[2], 16) {
-                            product_id = p;
-                        }
-                    }
-                } else if let Some(val) = line.strip_prefix("HID_NAME=") {
-                    product_string = val.trim().to_string();
-                } else if let Some(val) = line.strip_prefix("HID_PHYS=") {
-                    phys = val.trim().to_string();
-                }
-            }
-        }
-
-        if phys.is_empty() {
-            if let Ok(s) = fs::read_to_string(dev_dir.join("phys")) {
-                phys = s.trim().to_string();
-            }
-        }
-
-        // 2. Discover interface number from bInterfaceNumber file or path
-        if let Some(ref rp) = real_path {
-            let parts: Vec<String> = rp
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect();
-            let mut iface_idx = None;
-            for (idx, comp) in parts.iter().enumerate() {
-                if comp.matches(':').count() == 1 {
-                    if let Some((_, after_colon)) = comp.split_once(':') {
-                        if after_colon.starts_with("1.") && after_colon.contains('.') {
-                            iface_idx = Some(idx);
-                        }
-                    }
-                }
-            }
-            if let Some(idx) = iface_idx {
-                if idx > 0 {
-                    usb_parent = parts[idx - 1].clone();
-                } else if let Some((before_colon, _)) = parts[idx].split_once(':') {
-                    usb_parent = before_colon.to_string();
-                }
-            }
-
-            if let Some(parent) = rp.parent() {
-                let iface_file = parent.join("bInterfaceNumber");
-                if let Ok(s) = fs::read_to_string(&iface_file) {
-                    if let Ok(num) = s.trim().parse::<i32>() {
-                        interface_number = Some(num);
-                    }
-                }
-                if usb_parent.is_empty() {
-                    if let Some(gp) = parent.parent() {
-                        usb_parent = gp.file_name().unwrap_or_default().to_string_lossy().to_string();
-                    }
-                }
-            }
-
-            // Fallback: check path components for pattern <bus>:<config>.<interface>
-            if interface_number.is_none() {
-                for comp in rp.components() {
-                    let s = comp.as_os_str().to_string_lossy();
-                    if s.matches(':').count() == 1 {
-                        if let Some((_, after)) = s.split_once(':') {
-                            if let Some((_, iface_str)) = after.split_once('.') {
-                                if let Ok(num) = iface_str.parse::<i32>() {
-                                    interface_number = Some(num);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 3. Discover manufacturer, product, release from USB ancestors
-            let mut curr = rp.parent();
-            for _ in 0..4 {
-                if let Some(p) = curr {
-                    if manufacturer_string.is_empty() {
-                        let mfg_file = p.join("manufacturer");
-                        if let Ok(s) = fs::read_to_string(&mfg_file) {
-                            manufacturer_string = s.trim().to_string();
-                        }
-                    }
-                    if product_string.is_empty() {
-                        let prod_file = p.join("product");
-                        if let Ok(s) = fs::read_to_string(&prod_file) {
-                            product_string = s.trim().to_string();
-                        }
-                    }
-                    if release_number == 0 {
-                        let bcd_file = p.join("bcdDevice");
-                        if let Ok(s) = fs::read_to_string(&bcd_file) {
-                            if let Ok(r) = u16::from_str_radix(s.trim(), 16) {
-                                release_number = r;
-                            }
-                        }
-                    }
-                    if vendor_id == 0 {
-                        let v_file = p.join("idVendor");
-                        if let Ok(s) = fs::read_to_string(&v_file) {
-                            if let Ok(v) = u16::from_str_radix(s.trim(), 16) {
-                                vendor_id = v;
-                            }
-                        }
-                    }
-                    if product_id == 0 {
-                        let p_file = p.join("idProduct");
-                        if let Ok(s) = fs::read_to_string(&p_file) {
-                            if let Ok(p_val) = u16::from_str_radix(s.trim(), 16) {
-                                product_id = p_val;
-                            }
-                        }
-                    }
-                    curr = p.parent();
-                } else {
-                    break;
-                }
-            }
-        }
-
-        let is_known = vendor_id == KNOWN_VID && product_id == KNOWN_PID;
-        let device_name = if is_known {
-            "AULA F75".to_string()
-        } else {
-            "Unknown".to_string()
-        };
-
-        results.push(DeviceInfo {
-            vendor_id,
-            product_id,
-            path: dev_path,
-            interface_number,
-            manufacturer_string,
-            product_string,
-            release_number,
-            usage_page: 0,
-            usage: 0,
-            is_known,
-            device_name,
-            usb_parent,
-            phys,
-        });
-    }
-
-    results
+/// Enumerate HID device nodes from sysfs and parse device attributes.
+pub fn enumerate_devices(sys_class_hidraw: &Path) -> Vec<DeviceInfo> {
+    let entries = match get_sorted_hidraw_entries(sys_class_hidraw) {
+        Some(e) => e,
+        None => return Vec::new(),
+    };
+    entries.iter().map(|e| build_device_info(e)).collect()
 }
 
 /// Classification of HID device connection topology.
@@ -547,6 +605,45 @@ where
     }
 }
 
+fn try_send_frame_step<F, S>(
+    send_fn: &mut F,
+    frame: &[u8; crate::proto::FRAME_LEN],
+    consecutive_failures: &mut usize,
+    interval: Duration,
+    sleep_fn: &mut S,
+) -> Result<bool, io::Error>
+where
+    F: FnMut(&[u8; crate::proto::FRAME_LEN]) -> Result<(), io::Error>,
+    S: FnMut(Duration),
+{
+    match send_fn(frame) {
+        Ok(()) => {
+            *consecutive_failures = 0;
+            Ok(true)
+        }
+        Err(e) => {
+            let code = e.raw_os_error();
+            if code == Some(libc::EPIPE) || code == Some(libc::ETIMEDOUT) {
+                *consecutive_failures += 1;
+                if *consecutive_failures >= 10 {
+                    return Err(e);
+                }
+                sleep_fn(interval);
+                Ok(false)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+fn is_loop_timeout_reached(start_time: Instant, seconds: Option<f64>, count: u64) -> bool {
+    match seconds {
+        Some(sec) if sec > 0.0 => count >= 2 && start_time.elapsed().as_secs_f64() >= sec,
+        _ => false,
+    }
+}
+
 /// Run direct RGB frame keepalive loop until `seconds` expires or `is_running_fn` returns false.
 pub fn run_keepalive_loop<F, S, R>(
     rgb: (u8, u8, u8),
@@ -568,38 +665,25 @@ where
     let mut consecutive_failures = 0;
 
     while is_running_fn() {
-        match send_fn(&frame) {
-            Ok(()) => {
-                consecutive_failures = 0;
-            }
-            Err(e) => {
-                let code = e.raw_os_error();
-                if code == Some(libc::EPIPE) || code == Some(libc::ETIMEDOUT) {
-                    consecutive_failures += 1;
-                    if consecutive_failures >= 10 {
-                        return Err(e);
-                    }
-                    sleep_fn(interval);
-                    continue;
-                } else {
-                    return Err(e);
-                }
-            }
+        if !try_send_frame_step(
+            &mut send_fn,
+            &frame,
+            &mut consecutive_failures,
+            interval,
+            &mut sleep_fn,
+        )? {
+            continue;
         }
 
         count += 1;
-        if let Some(sec) = seconds {
-            if sec > 0.0 && start_time.elapsed().as_secs_f64() >= sec && count >= 2 {
-                break;
-            }
+        if is_loop_timeout_reached(start_time, seconds, count) {
+            break;
         }
 
         sleep_fn(interval);
 
-        if let Some(sec) = seconds {
-            if sec > 0.0 && start_time.elapsed().as_secs_f64() >= sec && count >= 2 {
-                break;
-            }
+        if is_loop_timeout_reached(start_time, seconds, count) {
+            break;
         }
     }
 
@@ -646,42 +730,42 @@ where
     let mut consecutive_failures = 0;
 
     while is_running_fn() {
-        match send_fn(&frame) {
-            Ok(()) => {
-                consecutive_failures = 0;
-            }
-            Err(e) => {
-                let code = e.raw_os_error();
-                if code == Some(libc::EPIPE) || code == Some(libc::ETIMEDOUT) {
-                    consecutive_failures += 1;
-                    if consecutive_failures >= 10 {
-                        return Err(e);
-                    }
-                    sleep_fn(interval);
-                    continue;
-                } else {
-                    return Err(e);
-                }
-            }
+        if !try_send_frame_step(
+            &mut send_fn,
+            &frame,
+            &mut consecutive_failures,
+            interval,
+            &mut sleep_fn,
+        )? {
+            continue;
         }
 
         count += 1;
-        if let Some(sec) = seconds {
-            if sec > 0.0 && start_time.elapsed().as_secs_f64() >= sec && count >= 2 {
-                break;
-            }
+        if is_loop_timeout_reached(start_time, seconds, count) {
+            break;
         }
 
         sleep_fn(interval);
 
-        if let Some(sec) = seconds {
-            if sec > 0.0 && start_time.elapsed().as_secs_f64() >= sec && count >= 2 {
-                break;
-            }
+        if is_loop_timeout_reached(start_time, seconds, count) {
+            break;
         }
     }
 
     Ok(())
+}
+
+fn build_effect_frame(
+    effect: &crate::effects::Effect,
+    brightness: f32,
+    start_time: Instant,
+    key_slots: &[u8],
+) -> Result<[u8; crate::proto::FRAME_LEN], io::Error> {
+    let t = start_time.elapsed().as_secs_f64();
+    let pairs = crate::effects::render(effect, t, key_slots);
+    let scaled = crate::effects::apply_brightness(&pairs, brightness);
+    crate::proto::build_slot_frame(&scaled)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
 }
 
 /// Run host-rendered RGB effect streaming loop until `seconds` expires or `is_running_fn` returns false.
@@ -706,44 +790,27 @@ where
     let mut consecutive_failures = 0;
 
     while is_running_fn() {
-        let t = start_time.elapsed().as_secs_f64();
-        let pairs = crate::effects::render(effect, t, &key_slots);
-        let scaled = crate::effects::apply_brightness(&pairs, brightness);
-        let frame = crate::proto::build_slot_frame(&scaled)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let frame = build_effect_frame(effect, brightness, start_time, &key_slots)?;
 
-        match send_fn(&frame) {
-            Ok(()) => {
-                consecutive_failures = 0;
-            }
-            Err(e) => {
-                let code = e.raw_os_error();
-                if code == Some(libc::EPIPE) || code == Some(libc::ETIMEDOUT) {
-                    consecutive_failures += 1;
-                    if consecutive_failures >= 10 {
-                        return Err(e);
-                    }
-                    sleep_fn(interval);
-                    continue;
-                } else {
-                    return Err(e);
-                }
-            }
+        if !try_send_frame_step(
+            &mut send_fn,
+            &frame,
+            &mut consecutive_failures,
+            interval,
+            &mut sleep_fn,
+        )? {
+            continue;
         }
 
         count += 1;
-        if let Some(sec) = seconds {
-            if sec > 0.0 && start_time.elapsed().as_secs_f64() >= sec && count >= 2 {
-                break;
-            }
+        if is_loop_timeout_reached(start_time, seconds, count) {
+            break;
         }
 
         sleep_fn(interval);
 
-        if let Some(sec) = seconds {
-            if sec > 0.0 && start_time.elapsed().as_secs_f64() >= sec && count >= 2 {
-                break;
-            }
+        if is_loop_timeout_reached(start_time, seconds, count) {
+            break;
         }
     }
 

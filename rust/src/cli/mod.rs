@@ -243,147 +243,220 @@ pub enum ProfileCommands {
     },
 }
 
-/// Execute CLI commands and return exit code.
-pub fn run() -> i32 {
-    let cli = Cli::parse();
-    match cli.command {
+fn parse_optional_filter(val: Option<String>, flag_name: &str) -> Result<Option<u16>, ()> {
+    match val.as_deref().map(parse_hex_or_dec) {
+        Some(Ok(v)) => Ok(Some(v)),
+        Some(Err(e)) => {
+            eprintln!("Error parsing {}: {}", flag_name, e);
+            Err(())
+        }
+        None => Ok(None),
+    }
+}
+
+fn handle_info_cmd(path: Option<String>, vid: Option<String>, pid: Option<String>) -> i32 {
+    let parsed_vid = match parse_optional_filter(vid, "--vid") {
+        Ok(v) => v,
+        Err(()) => return 2,
+    };
+    let parsed_pid = match parse_optional_filter(pid, "--pid") {
+        Ok(p) => p,
+        Err(()) => return 2,
+    };
+    let devices = device::enumerate_devices(Path::new(device::DEFAULT_SYSFS_HIDRAW));
+    cmd_info(&devices, path.as_deref(), parsed_vid, parsed_pid)
+}
+
+fn handle_solid_cmd(color: String, seconds: Option<f64>) -> i32 {
+    let rgb = match parse_color_hex(&color) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error parsing hex color: {}", e);
+            return 2;
+        }
+    };
+    run_lighting(rgb, seconds)
+}
+
+fn handle_off_cmd(seconds: f64) -> i32 {
+    let sec = if seconds <= 0.0 { 2.0 } else { seconds };
+    run_lighting((0, 0, 0), Some(sec))
+}
+
+fn handle_key_cmd(name: String, color: String, seconds: Option<f64>) -> i32 {
+    if proto::slot_for_key(&name).is_none() {
+        eprintln!(
+            "Error: Unknown key '{}'. Use 'aula-f75-rs keys' to see available keys.",
+            name
+        );
+        return 2;
+    }
+    let rgb = match parse_color_hex(&color) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error parsing hex color: {}", e);
+            return 2;
+        }
+    };
+    run_key_lighting(&name, rgb, seconds)
+}
+
+fn is_color_required_effect(name: &str) -> bool {
+    name == "solid" || name == "breathe"
+}
+
+fn is_color_ignored_effect(name: &str) -> bool {
+    name == "rainbow" || name == "wave" || name == "stars" || name == "off"
+}
+
+fn validate_fx_color(lower_name: &str, name: &str, has_color: bool) -> Result<(), ()> {
+    if is_color_required_effect(lower_name) && !has_color {
+        eprintln!("Error: Effect '{}' requires --color RRGGBB", name);
+        return Err(());
+    }
+    if is_color_ignored_effect(lower_name) && has_color {
+        eprintln!("Warning: --color is ignored for effect '{}'", name);
+    }
+    Ok(())
+}
+
+fn parse_optional_color(color: Option<&str>) -> Result<Option<crate::effects::RGB>, ()> {
+    match color {
+        Some(c) => match parse_color_hex(c) {
+            Ok((r, g, b)) => Ok(Some(crate::effects::RGB(r, g, b))),
+            Err(e) => {
+                eprintln!("Error parsing hex color: {}", e);
+                Err(())
+            }
+        },
+        None => Ok(None),
+    }
+}
+
+fn handle_fx_cmd(
+    name: String,
+    color: Option<String>,
+    brightness: f32,
+    speed: f32,
+    seconds: Option<f64>,
+) -> i32 {
+    if let Err(e) = validate_effect_speed(speed) {
+        eprintln!("Error: {}", e);
+        return 2;
+    }
+
+    let lower_name = name.trim().to_ascii_lowercase();
+    if validate_fx_color(&lower_name, &name, color.is_some()).is_err() {
+        return 2;
+    }
+
+    let parsed_color = match parse_optional_color(color.as_deref()) {
+        Ok(c) => c,
+        Err(()) => return 2,
+    };
+
+    let effect = match crate::effects::Effect::from_name_with_speed(&name, parsed_color, speed) {
+        Ok(eff) => eff,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return 2;
+        }
+    };
+
+    let clamped_brightness = brightness.clamp(0.0, 1.0);
+    run_effect_lighting(&effect, clamped_brightness, seconds)
+}
+
+fn handle_music_cmd(
+    mode: String,
+    color: String,
+    gain: f32,
+    seconds: Option<f64>,
+) -> i32 {
+    let parsed_mode = match mode.parse::<music::MusicMode>() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return 2;
+        }
+    };
+    let parsed_color = match parse_color_hex(&color) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error parsing hex color: {}", e);
+            return 2;
+        }
+    };
+    let clamped_gain = gain.max(0.01);
+    run_music_lighting(parsed_mode, parsed_color, clamped_gain, seconds)
+}
+
+fn dispatch_discovery_command(cmd: Commands) -> i32 {
+    match cmd {
         Commands::List => {
             let devices = device::enumerate_devices(Path::new(device::DEFAULT_SYSFS_HIDRAW));
             cmd_list(&devices)
         }
-        Commands::Info { path, vid, pid } => {
-            let parsed_vid = match vid.as_deref().map(parse_hex_or_dec) {
-                Some(Ok(v)) => Some(v),
-                Some(Err(e)) => {
-                    eprintln!("Error parsing --vid: {}", e);
-                    return 2;
-                }
-                None => None,
-            };
-            let parsed_pid = match pid.as_deref().map(parse_hex_or_dec) {
-                Some(Ok(p)) => Some(p),
-                Some(Err(e)) => {
-                    eprintln!("Error parsing --pid: {}", e);
-                    return 2;
-                }
-                None => None,
-            };
-            let devices = device::enumerate_devices(Path::new(device::DEFAULT_SYSFS_HIDRAW));
-            cmd_info(&devices, path.as_deref(), parsed_vid, parsed_pid)
-        }
-        Commands::Solid { color, seconds } => {
-            let rgb = match parse_color_hex(&color) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Error parsing hex color: {}", e);
-                    return 2;
-                }
-            };
-            run_lighting(rgb, seconds)
-        }
-        Commands::Off { seconds } => {
-            let sec = if seconds <= 0.0 { 2.0 } else { seconds };
-            run_lighting((0, 0, 0), Some(sec))
-        }
-        Commands::Key {
-            name,
-            color,
-            seconds,
-        } => {
-            if proto::slot_for_key(&name).is_none() {
-                eprintln!(
-                    "Error: Unknown key '{}'. Use 'aula-f75-rs keys' to see available keys.",
-                    name
-                );
-                return 2;
-            }
-            let rgb = match parse_color_hex(&color) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Error parsing hex color: {}", e);
-                    return 2;
-                }
-            };
-            run_key_lighting(&name, rgb, seconds)
-        }
+        Commands::Info { path, vid, pid } => handle_info_cmd(path, vid, pid),
+        Commands::Battery => cmd_battery(),
+        Commands::Wireless => cmd_wireless(),
+        Commands::Knob => cmd_knob(),
+        _ => unreachable!(),
+    }
+}
+
+fn dispatch_lighting_command(cmd: Commands) -> i32 {
+    match cmd {
+        Commands::Solid { color, seconds } => handle_solid_cmd(color, seconds),
+        Commands::Off { seconds } => handle_off_cmd(seconds),
+        Commands::Key { name, color, seconds } => handle_key_cmd(name, color, seconds),
         Commands::Keys => cmd_keys(),
+        _ => unreachable!(),
+    }
+}
+
+fn dispatch_effects_command(cmd: Commands) -> i32 {
+    match cmd {
         Commands::Fx {
             name,
             color,
             brightness,
             speed,
             seconds,
-        } => {
-            if let Err(e) = validate_effect_speed(speed) {
-                eprintln!("Error: {}", e);
-                return 2;
-            }
-
-            let lower_name = name.trim().to_ascii_lowercase();
-            if (lower_name == "solid" || lower_name == "breathe") && color.is_none() {
-                eprintln!("Error: Effect '{}' requires --color RRGGBB", name);
-                return 2;
-            }
-            if (lower_name == "rainbow"
-                || lower_name == "wave"
-                || lower_name == "stars"
-                || lower_name == "off")
-                && color.is_some()
-            {
-                eprintln!("Warning: --color is ignored for effect '{}'", name);
-            }
-
-            let parsed_color = match color.as_deref() {
-                Some(c) => match parse_color_hex(c) {
-                    Ok((r, g, b)) => Some(crate::effects::RGB(r, g, b)),
-                    Err(e) => {
-                        eprintln!("Error parsing hex color: {}", e);
-                        return 2;
-                    }
-                },
-                None => None,
-            };
-
-            let effect = match crate::effects::Effect::from_name_with_speed(&name, parsed_color, speed) {
-                Ok(eff) => eff,
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    return 2;
-                }
-            };
-
-            let clamped_brightness = brightness.clamp(0.0, 1.0);
-            run_effect_lighting(&effect, clamped_brightness, seconds)
-        }
+        } => handle_fx_cmd(name, color, brightness, speed, seconds),
         Commands::Effects => cmd_effects(),
-        Commands::Profile { action } => cmd_profile(&action),
         Commands::Music {
             mode,
             color,
             gain,
             seconds,
-        } => {
-            let parsed_mode = match mode.parse::<music::MusicMode>() {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    return 2;
-                }
-            };
-            let parsed_color = match parse_color_hex(&color) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Error parsing hex color: {}", e);
-                    return 2;
-                }
-            };
-            let clamped_gain = gain.max(0.01);
-            run_music_lighting(parsed_mode, parsed_color, clamped_gain, seconds)
-        }
-        Commands::Battery => cmd_battery(),
-        Commands::Wireless => cmd_wireless(),
-        Commands::Knob => cmd_knob(),
+        } => handle_music_cmd(mode, color, gain, seconds),
+        _ => unreachable!(),
     }
+}
+
+fn dispatch_command(cmd: Commands) -> i32 {
+    match cmd {
+        Commands::List
+        | Commands::Info { .. }
+        | Commands::Battery
+        | Commands::Wireless
+        | Commands::Knob => dispatch_discovery_command(cmd),
+        Commands::Solid { .. }
+        | Commands::Off { .. }
+        | Commands::Key { .. }
+        | Commands::Keys => dispatch_lighting_command(cmd),
+        Commands::Fx { .. }
+        | Commands::Effects
+        | Commands::Music { .. } => dispatch_effects_command(cmd),
+        Commands::Profile { action } => cmd_profile(&action),
+    }
+}
+
+/// Execute CLI commands and return exit code.
+pub fn run() -> i32 {
+    let cli = Cli::parse();
+    dispatch_command(cli.command)
 }
 #[cfg(test)]
 mod tests;

@@ -29,6 +29,44 @@ impl BatteryStatus {
     }
 }
 
+fn is_actively_charging(lower: &str) -> bool {
+    lower.contains("charging") && !lower.contains("not charging") && !lower.contains("discharging")
+}
+
+fn is_not_charging(lower: &str) -> bool {
+    lower.contains("discharging") || lower.contains("not charging") || lower.contains("full")
+}
+
+fn parse_charging_status(s: &str) -> Option<bool> {
+    let lower = s.trim().to_ascii_lowercase();
+    if is_actively_charging(&lower) {
+        Some(true)
+    } else if is_not_charging(&lower) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn read_sysfs_capacity(dir: &Path, raw: &mut Vec<u8>) -> Option<u8> {
+    let s = fs::read_to_string(dir.join("capacity")).ok()?;
+    raw.extend_from_slice(s.as_bytes());
+    let num = s.trim().parse::<u16>().ok()?;
+    Some(num.min(100) as u8)
+}
+
+fn read_sysfs_status_file(dir: &Path, raw: &mut Vec<u8>) -> Option<bool> {
+    let s = fs::read_to_string(dir.join("status")).ok()?;
+    raw.extend_from_slice(s.as_bytes());
+    parse_charging_status(&s)
+}
+
+fn read_sysfs_present(dir: &Path) -> bool {
+    fs::read_to_string(dir.join("present"))
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false)
+}
+
 /// Read battery attributes from a specific sysfs power supply directory.
 ///
 /// Inspects standard Linux `power_supply` class attributes:
@@ -40,40 +78,10 @@ pub fn read_sysfs_battery(power_supply_dir: &Path) -> BatteryStatus {
         return BatteryStatus::empty();
     }
 
-    let mut percent: Option<u8> = None;
-    let mut charging: Option<bool> = None;
-    let mut present = false;
     let mut raw = Vec::new();
-
-    // Check capacity
-    let cap_file = power_supply_dir.join("capacity");
-    if let Ok(s) = fs::read_to_string(&cap_file) {
-        raw.extend_from_slice(s.as_bytes());
-        if let Ok(num) = s.trim().parse::<u16>() {
-            percent = Some(num.min(100) as u8);
-            present = true;
-        }
-    }
-
-    // Check status
-    let status_file = power_supply_dir.join("status");
-    if let Ok(s) = fs::read_to_string(&status_file) {
-        raw.extend_from_slice(s.as_bytes());
-        let lower = s.trim().to_ascii_lowercase();
-        if lower.contains("charging") && !lower.contains("not charging") && !lower.contains("discharging") {
-            charging = Some(true);
-        } else if lower.contains("discharging") || lower.contains("not charging") || lower.contains("full") {
-            charging = Some(false);
-        }
-    }
-
-    // Check present
-    let present_file = power_supply_dir.join("present");
-    if let Ok(s) = fs::read_to_string(&present_file) {
-        if s.trim() == "1" {
-            present = true;
-        }
-    }
+    let percent = read_sysfs_capacity(power_supply_dir, &mut raw);
+    let charging = read_sysfs_status_file(power_supply_dir, &mut raw);
+    let present = percent.is_some() || read_sysfs_present(power_supply_dir);
 
     BatteryStatus {
         present,
@@ -81,6 +89,50 @@ pub fn read_sysfs_battery(power_supply_dir: &Path) -> BatteryStatus {
         charging,
         raw,
     }
+}
+
+fn path_matches_filter(path: &Path, filter: &str) -> bool {
+    let f_lower = filter.to_ascii_lowercase();
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    name.contains(&f_lower)
+}
+
+fn check_direct_battery(root: &Path, device_filter: Option<&str>) -> Option<BatteryStatus> {
+    if !root.join("capacity").is_file() {
+        return None;
+    }
+    if let Some(filter) = device_filter {
+        if !path_matches_filter(root, filter) {
+            return Some(BatteryStatus::empty());
+        }
+    }
+    Some(read_sysfs_battery(root))
+}
+
+fn collect_battery_candidates(root: &Path, device_filter: Option<&str>) -> Vec<std::path::PathBuf> {
+    let read_dir = match fs::read_dir(root) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    read_dir
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| device_filter.map_or(true, |f| path_matches_filter(p, f)))
+        .collect()
+}
+
+fn find_first_active_battery(candidates: &[std::path::PathBuf]) -> BatteryStatus {
+    for path in candidates {
+        let status = read_sysfs_battery(path);
+        if status.present || status.percent.is_some() {
+            return status;
+        }
+    }
+    BatteryStatus::empty()
 }
 
 /// Query sysfs power supply entries with an injectable root path.
@@ -95,53 +147,12 @@ pub fn query_sysfs_battery_for_device(
         return BatteryStatus::empty();
     }
 
-    // Direct power_supply entry check (if root itself has capacity/status files)
-    if power_supply_root.join("capacity").is_file() {
-        if let Some(filter) = device_filter {
-            let f_lower = filter.to_ascii_lowercase();
-            let name = power_supply_root
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_ascii_lowercase();
-            if !name.contains(&f_lower) {
-                return BatteryStatus::empty();
-            }
-        }
-        return read_sysfs_battery(power_supply_root);
+    if let Some(status) = check_direct_battery(power_supply_root, device_filter) {
+        return status;
     }
 
-    let read_dir = match fs::read_dir(power_supply_root) {
-        Ok(r) => r,
-        Err(_) => return BatteryStatus::empty(),
-    };
-
-    let mut candidates = Vec::new();
-    for entry in read_dir.flatten() {
-        candidates.push(entry.path());
-    }
-
-    // When filter is supplied, skip non-matching entries entirely
-    if let Some(filter) = device_filter {
-        let f_lower = filter.to_ascii_lowercase();
-        candidates.retain(|p| {
-            let name = p
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_ascii_lowercase();
-            name.contains(&f_lower)
-        });
-    }
-
-    for path in candidates {
-        let status = read_sysfs_battery(&path);
-        if status.present || status.percent.is_some() {
-            return status;
-        }
-    }
-
-    BatteryStatus::empty()
+    let candidates = collect_battery_candidates(power_supply_root, device_filter);
+    find_first_active_battery(&candidates)
 }
 
 /// Parse a raw HID GET_FEATURE response payload for battery status.
