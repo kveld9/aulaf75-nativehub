@@ -136,6 +136,30 @@ aula-f75-rs info
 aula-f75-rs info --path /dev/hidraw0
 ```
 
+### Query battery status
+
+Reads safe sysfs power supply attributes and HID feature telemetry:
+
+```bash
+aula-f75-rs battery
+```
+
+### Detect 2.4GHz wireless dongle
+
+Analyzes USB topology, interface numbers, and phys properties to distinguish direct cable vs 2.4GHz wireless dongle connections:
+
+```bash
+aula-f75-rs wireless
+```
+
+### Report multifunction knob mode
+
+Inspects HID report descriptors and input event sources to determine observed rotary knob behavior:
+
+```bash
+aula-f75-rs knob
+```
+
 ### Set solid RGB color
 
 Sets whole-board static color using a 6-digit hex string (with or without `#`):

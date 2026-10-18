@@ -11,6 +11,9 @@ pub const KNOWN_VID: u16 = 0x258A;
 /// Known Product ID for AULA F75 (0x010C).
 pub const KNOWN_PID: u16 = 0x010C;
 
+#[path = "power.rs"]
+pub mod power;
+
 /// Normalized metadata for an enumerated HID device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
@@ -25,6 +28,8 @@ pub struct DeviceInfo {
     pub usage: u16,
     pub is_known: bool,
     pub device_name: String,
+    pub usb_parent: String,
+    pub phys: String,
 }
 
 /// Resolve the `/dev/hidrawN` path for USB interface 1 via sysfs without hidapi.
@@ -208,6 +213,8 @@ pub fn enumerate_devices(sys_class_hidraw: &Path) -> Vec<DeviceInfo> {
         let mut manufacturer_string = String::new();
         let mut interface_number: Option<i32> = None;
         let mut release_number: u16 = 0;
+        let mut usb_parent = String::new();
+        let mut phys = String::new();
 
         let dev_dir = entry.join("device");
         let real_path = fs::canonicalize(&dev_dir).ok();
@@ -229,17 +236,52 @@ pub fn enumerate_devices(sys_class_hidraw: &Path) -> Vec<DeviceInfo> {
                     }
                 } else if let Some(val) = line.strip_prefix("HID_NAME=") {
                     product_string = val.trim().to_string();
+                } else if let Some(val) = line.strip_prefix("HID_PHYS=") {
+                    phys = val.trim().to_string();
                 }
+            }
+        }
+
+        if phys.is_empty() {
+            if let Ok(s) = fs::read_to_string(dev_dir.join("phys")) {
+                phys = s.trim().to_string();
             }
         }
 
         // 2. Discover interface number from bInterfaceNumber file or path
         if let Some(ref rp) = real_path {
+            let parts: Vec<String> = rp
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            let mut iface_idx = None;
+            for (idx, comp) in parts.iter().enumerate() {
+                if comp.matches(':').count() == 1 {
+                    if let Some((_, after_colon)) = comp.split_once(':') {
+                        if after_colon.starts_with("1.") && after_colon.contains('.') {
+                            iface_idx = Some(idx);
+                        }
+                    }
+                }
+            }
+            if let Some(idx) = iface_idx {
+                if idx > 0 {
+                    usb_parent = parts[idx - 1].clone();
+                } else if let Some((before_colon, _)) = parts[idx].split_once(':') {
+                    usb_parent = before_colon.to_string();
+                }
+            }
+
             if let Some(parent) = rp.parent() {
                 let iface_file = parent.join("bInterfaceNumber");
                 if let Ok(s) = fs::read_to_string(&iface_file) {
                     if let Ok(num) = s.trim().parse::<i32>() {
                         interface_number = Some(num);
+                    }
+                }
+                if usb_parent.is_empty() {
+                    if let Some(gp) = parent.parent() {
+                        usb_parent = gp.file_name().unwrap_or_default().to_string_lossy().to_string();
                     }
                 }
             }
@@ -327,10 +369,143 @@ pub fn enumerate_devices(sys_class_hidraw: &Path) -> Vec<DeviceInfo> {
             usage: 0,
             is_known,
             device_name,
+            usb_parent,
+            phys,
         });
     }
 
     results
+}
+
+/// Classification of HID device connection topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceConnectionKind {
+    /// Direct USB cable connection on interface 1 (control node).
+    CableInterface1Control,
+    /// Direct USB cable connection on interface 0 (boot keyboard).
+    CableInterface0Keyboard,
+    /// 2.4GHz wireless USB dongle receiver node.
+    WirelessDongle,
+    /// Matching AULA F75 device node.
+    CableCandidate,
+    /// Unknown or non-matching HID device.
+    Undetermined,
+}
+
+impl DeviceInfo {
+    /// Classify whether the device node corresponds to a cable connection or 2.4GHz wireless dongle.
+    pub fn classify_connection(&self) -> DeviceConnectionKind {
+        let prod_lower = self.product_string.to_ascii_lowercase();
+        let mfg_lower = self.manufacturer_string.to_ascii_lowercase();
+        let phys_lower = self.phys.to_ascii_lowercase();
+
+        let is_dongle_hint = prod_lower.contains("2.4g")
+            || prod_lower.contains("dongle")
+            || prod_lower.contains("receiver")
+            || prod_lower.contains("wireless")
+            || mfg_lower.contains("wireless")
+            || phys_lower.contains("wireless");
+
+        if is_dongle_hint {
+            return DeviceConnectionKind::WirelessDongle;
+        }
+
+        match self.interface_number {
+            Some(1) => DeviceConnectionKind::CableInterface1Control,
+            Some(0) => DeviceConnectionKind::CableInterface0Keyboard,
+            _ => {
+                if self.is_known {
+                    DeviceConnectionKind::CableCandidate
+                } else {
+                    DeviceConnectionKind::Undetermined
+                }
+            }
+        }
+    }
+}
+
+/// Candidate HID node for wireless dongle or cable connection inspection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WirelessNodeCandidate {
+    pub path: PathBuf,
+    pub interface_number: Option<i32>,
+    pub usb_parent: String,
+    pub phys: String,
+    pub connection_kind: DeviceConnectionKind,
+    pub is_dongle: bool,
+    pub detail: String,
+}
+
+/// Enumerate AULA F75 HID device nodes and classify each node as cable interface 1 vs wireless dongle.
+pub fn enumerate_wireless_nodes_with_roots(sys_class_hidraw: &Path) -> Vec<WirelessNodeCandidate> {
+    let devices = enumerate_devices(sys_class_hidraw);
+    let mut candidates = Vec::new();
+
+    for dev in devices.into_iter().filter(|d| d.is_known) {
+        let kind = dev.classify_connection();
+        let is_dongle = kind == DeviceConnectionKind::WirelessDongle;
+        let detail = match kind {
+            DeviceConnectionKind::CableInterface1Control => {
+                "Direct USB cable connection (Interface 1 control node)".to_string()
+            }
+            DeviceConnectionKind::CableInterface0Keyboard => {
+                "Direct USB cable connection (Interface 0 boot keyboard)".to_string()
+            }
+            DeviceConnectionKind::WirelessDongle => {
+                "2.4GHz USB wireless dongle receiver node".to_string()
+            }
+            DeviceConnectionKind::CableCandidate => {
+                "Matching AULA F75 node on USB parent".to_string()
+            }
+            DeviceConnectionKind::Undetermined => {
+                "Undetermined USB HID node".to_string()
+            }
+        };
+
+        candidates.push(WirelessNodeCandidate {
+            path: dev.path,
+            interface_number: dev.interface_number,
+            usb_parent: dev.usb_parent,
+            phys: dev.phys,
+            connection_kind: kind,
+            is_dongle,
+            detail,
+        });
+    }
+
+    candidates
+}
+
+/// Inspect report descriptors of enumerated AULA F75 devices to determine observed knob behavior.
+pub fn query_knob_mode_with_roots(sys_class_hidraw: &Path) -> crate::proto::KnobReport {
+    if !sys_class_hidraw.is_dir() {
+        return crate::proto::KnobReport {
+            source: crate::proto::KnobModeSource::Undetermined,
+            description: "undetermined, needs live USB capture".to_string(),
+            details: vec!["Sysfs hidraw directory not found".to_string()],
+        };
+    }
+
+    let devs = enumerate_devices(sys_class_hidraw);
+    for dev in devs.iter().filter(|d| d.is_known) {
+        let entry_name = dev.path.file_name().unwrap_or_default().to_string_lossy();
+        let desc_path = sys_class_hidraw.join(entry_name.as_ref()).join("device/report_descriptor");
+        if let Ok(bytes) = fs::read(&desc_path) {
+            let report = crate::proto::parse_knob_from_report_descriptor(&bytes);
+            if report.source != crate::proto::KnobModeSource::Undetermined {
+                return report;
+            }
+        }
+    }
+
+    crate::proto::KnobReport {
+        source: crate::proto::KnobModeSource::Undetermined,
+        description: "undetermined, needs live USB capture".to_string(),
+        details: vec![
+            "No rotary encoder usage detected in enumerated HID report descriptors".to_string(),
+            "AULA F75 rotary knob switches between Volume and Backlight modes via onboard firmware without host report remapping".to_string(),
+        ],
+    }
 }
 
 /// Send with retry and backoff on transient errors (EPIPE, ETIMEDOUT).

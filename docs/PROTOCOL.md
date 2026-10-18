@@ -29,10 +29,10 @@ The OEM configuration suite is distributed as a 32-bit PE executable (`.exe`) pa
 | **Command Mailbox / ISP** | Feature | `0x05` | N/A | Interface 1 | **PROHIBITED** (Soft-brick risk) |
 | **Key Remapping** | Feature / Output | `TBD` | `TBD` | Interface 1 | Pending Tranche 3 USB Capture |
 | **Macro Definitions** | Feature / Output | `TBD` | `TBD` | Interface 1 | Pending Tranche 3 USB Capture |
-| **Multifunction Knob Mode** | Feature / Output | `TBD` | `TBD` | Interface 1 | Pending Tranche 3 USB Capture |
+| **Multifunction Knob Mode** | Report Descriptor / Sysfs | `N/A` | Read-only | Interface 0 / 1 | Read-Only Observed; Host Remapping Pending Tranche 3 USB Capture |
 | **USB Polling Rate** | Feature / Output | `TBD` | `TBD` | Interface 1 | Pending Tranche 3 USB Capture |
-| **Wireless Dongle Protocol (2.4GHz)** | Feature / Input | `TBD` | `TBD` | Interface 1 | Pending Tranche 3 USB Capture |
-| **Battery Status Query** | Feature / Input | `TBD` | `TBD` | Interface 1 | Pending Tranche 3 USB Capture |
+| **Wireless Dongle Protocol (2.4GHz)** | Sysfs Topology & Phys | `N/A` | Read-only | Interface 0 / 1 | Read-Only Topology & Dongle Detection; Feature Commands Pending Tranche 3 USB Capture |
+| **Battery Status Query** | Sysfs & Feature (`HIDIOCGFEATURE`) | `TBD` | Read-only | Interface 1 | Read-Only Sysfs & GET_FEATURE Helper (Dormant in Wired Mode 258a:010c); Wireless Telemetry Pending Tranche 3 USB Capture |
 
 ---
 
@@ -96,6 +96,26 @@ Music mode renders dynamic audio-reactive lighting directly on the host CPU and 
   - `Bars`: Frequency band energies map horizontally across the physical 80-key layout following `KEY_SLOTS` order (`slot_i = band[i * nbands / nslots]`).
   - `Pulse`: Whole-board base color is scaled proportionally to average audio volume.
 - **Safety Invariant**: Transmitted strictly on the verified Report 6 path (`06 08 00 00 01 00 7A 01` header). Report 5 remains prohibited.
+
+### 3.4 Read-Only Hardware Discovery: Battery, Wireless Dongle & Rotary Knob
+
+To discover hardware capabilities safely without vendor `.exe` utilities or hazardous mailbox writes:
+
+1. **Battery Status Discovery**:
+   - **Sysfs Power Supply Inspection**: Queries `/sys/class/power_supply` for matching kernel HID battery devices (`capacity`, `status`, `present`).
+   - **Safe HID GET_FEATURE Telemetry**: Provides `HIDIOCGFEATURE` read helper protected by a hard guard against Report ID 5.
+   - **Wired Invariant (PID 010c)**: In standard wired USB mode, the MCU firmware exposes no standard battery telemetry over feature reports or sysfs power_supply entries. Reports "Not reported by device" gracefully without inventing synthetic percentage figures.
+   - **Pending Tranche 3 USB Capture**: Live USB capture during 2.4GHz wireless operation is required to confirm whether the wireless dongle multiplexes battery percentage via a dedicated input/feature report.
+
+2. **2.4GHz Wireless Dongle vs Direct Cable Detection**:
+   - **Sysfs Topology Resolution**: Evaluates USB bus parent identifiers, interface numbers, and `phys` attributes (e.g. `usb-0000:00:14.0-X/inputY`) across `/sys/class/hidraw/`.
+   - **Candidate Classification**: Distinguishes direct USB cable connection on Interface 1 (control node) vs Interface 0 (boot keyboard) vs 2.4GHz wireless dongle receiver node based on device naming and physical topology without executing any device writes.
+   - **Pending Tranche 3 USB Capture**: Vendor feature commands for wireless pairing, RF channel hopping, and dongle status require live USB packet analysis.
+
+3. **Multifunction Rotary Knob Mode Discovery**:
+   - **Report Descriptor Inspection**: Parses Linux `/sys/class/hidraw/hidrawX/device/report_descriptor` to determine what the OS observes: Consumer Control media events (Volume Increment `0x00E9`, Volume Decrement `0x00EA`, Mute `0x00E2`) vs Generic Desktop Dial/Wheel (`0x0037`/`0x0038`).
+   - **Onboard Multiplexing**: The AULA F75 knob hardware supports switching between Volume and Backlight modes via onboard long-press (~3-5 s). This transition is handled entirely inside the keyboard's MCU firmware and does not re-enumerate the HID report descriptor or signal the host.
+   - **Pending Tranche 3 USB Capture**: Capturing vendor software USB traffic is required to determine whether software-driven knob reassignment or lighting mode lock is possible via feature reports.
 
 ---
 

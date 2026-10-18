@@ -263,6 +263,209 @@ pub fn hid_set_feature(fd: RawFd, data: &[u8]) -> Result<(), io::Error> {
     Ok(())
 }
 
+/// Read a HID feature report using the Linux HIDIOCGFEATURE ioctl.
+///
+/// # Safety Rules
+/// - HARD SAFETY RULE: Access to Report ID 5 is strictly prohibited to prevent
+///   triggering the ISP bootloader / firmware mailbox states.
+/// - Requires `dir = 3` (READ|WRITE) ioctl direction on Linux hidraw.
+/// - The first byte of `buf` is populated with `report_id`.
+pub fn hid_get_feature(fd: RawFd, report_id: u8, buf: &mut [u8]) -> Result<usize, io::Error> {
+    if buf.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Feature report buffer cannot be empty",
+        ));
+    }
+
+    if report_id == 5 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Safety violation: access to report ID 5 is strictly prohibited",
+        ));
+    }
+
+    buf[0] = report_id;
+    let length = buf.len();
+    // HIDIOCGFEATURE(len) encoding:
+    // dir = 3 (READ|WRITE), size = length, type = 0x48 ('H'), nr = 0x07
+    let req = ((3u64 << 30) | ((length as u64) << 16) | (0x48u64 << 8) | 0x07u64) as libc::c_ulong;
+
+    let ret = unsafe { libc::ioctl(fd, req as libc::c_ulong, buf.as_mut_ptr()) };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(ret as usize)
+}
+
+/// Source of multifunction rotary knob behavior observed by the host OS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnobModeSource {
+    /// Consumer Control media keys (Volume Increment, Volume Decrement, Mute).
+    ConsumerControl,
+    /// Generic Desktop rotary dial or wheel usage.
+    GenericDesktopDial,
+    /// Vendor-defined HID usage.
+    VendorCustom(u16),
+    /// Undetermined behavior requiring live USB capture.
+    Undetermined,
+}
+
+/// Structured report of observed multifunction knob behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnobReport {
+    pub source: KnobModeSource,
+    pub description: String,
+    pub details: Vec<String>,
+}
+
+/// Parse a raw HID Report Descriptor to detect rotary knob / volume encoder usages.
+///
+/// Scans for:
+/// 1. Consumer Control usage page (0x05, 0x0C) with volume usages:
+///    Volume Increment (0x09, 0xE9), Volume Decrement (0x09, 0xEA), or Mute (0x09, 0xE2).
+/// 2. Generic Desktop usage page (0x05, 0x01) with Dial (0x09, 0x37) or Wheel (0x09, 0x38).
+///
+/// Returns `KnobModeSource::Undetermined` with description "undetermined, needs live USB capture"
+/// if the descriptor is empty, malformed, or contains no unambiguous rotary knob usages.
+pub fn parse_knob_from_report_descriptor(desc: &[u8]) -> KnobReport {
+    if desc.is_empty() {
+        return KnobReport {
+            source: KnobModeSource::Undetermined,
+            description: "undetermined, needs live USB capture".to_string(),
+            details: vec!["Empty report descriptor".to_string()],
+        };
+    }
+
+    let mut has_consumer_page = false;
+    let mut has_volume_inc = false;
+    let mut has_volume_dec = false;
+    let mut has_mute = false;
+
+    let mut has_generic_desktop_page = false;
+    let mut has_dial = false;
+    let mut has_wheel = false;
+
+    let mut current_page: Option<u16> = None;
+    let mut i = 0;
+
+    while i < desc.len() {
+        let prefix = desc[i];
+        if prefix == 0xFE {
+            // Long item (prefix 0xFE followed by length byte, tag byte, data)
+            if i + 2 < desc.len() {
+                let data_len = desc[i + 1] as usize;
+                i += 3 + data_len;
+            } else {
+                break;
+            }
+            continue;
+        }
+
+        let b_size = (prefix & 0x03) as usize;
+        let data_bytes = match b_size {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 4,
+            _ => 0,
+        };
+
+        if i + 1 + data_bytes > desc.len() {
+            break;
+        }
+
+        let item_data = &desc[i + 1..i + 1 + data_bytes];
+        let b_type = (prefix >> 2) & 0x03;
+        let b_tag = (prefix >> 4) & 0x0F;
+
+        // Global item: Usage Page (bType = 1, bTag = 0)
+        if b_type == 1 && b_tag == 0 {
+            let page = match data_bytes {
+                1 => item_data[0] as u16,
+                2 => (item_data[0] as u16) | ((item_data[1] as u16) << 8),
+                _ => 0,
+            };
+            current_page = Some(page);
+            if page == 0x000C {
+                has_consumer_page = true;
+            } else if page == 0x0001 {
+                has_generic_desktop_page = true;
+            }
+        }
+
+        // Local item: Usage (bType = 2, bTag = 0)
+        if b_type == 2 && b_tag == 0 {
+            let usage = match data_bytes {
+                1 => item_data[0] as u16,
+                2 => (item_data[0] as u16) | ((item_data[1] as u16) << 8),
+                _ => 0,
+            };
+
+            if current_page == Some(0x000C) || (current_page.is_none() && has_consumer_page) {
+                if usage == 0x00E9 {
+                    has_volume_inc = true;
+                } else if usage == 0x00EA {
+                    has_volume_dec = true;
+                } else if usage == 0x00E2 {
+                    has_mute = true;
+                }
+            } else if current_page == Some(0x0001) || (current_page.is_none() && has_generic_desktop_page) {
+                if usage == 0x0037 {
+                    has_dial = true;
+                } else if usage == 0x0038 {
+                    has_wheel = true;
+                }
+            }
+        }
+
+        i += 1 + data_bytes;
+    }
+
+    if has_consumer_page && (has_volume_inc || has_volume_dec || has_mute) {
+        let mut details = vec!["Usage Page: Consumer Control (0x0C)".to_string()];
+        if has_volume_inc {
+            details.push("Usage: Volume Increment (0x00E9)".to_string());
+        }
+        if has_volume_dec {
+            details.push("Usage: Volume Decrement (0x00EA)".to_string());
+        }
+        if has_mute {
+            details.push("Usage: Mute (0x00E2)".to_string());
+        }
+        return KnobReport {
+            source: KnobModeSource::ConsumerControl,
+            description: "Consumer Control (Volume Up / Volume Down / Mute)".to_string(),
+            details,
+        };
+    }
+
+    if has_generic_desktop_page && (has_dial || has_wheel) {
+        let mut details = vec!["Usage Page: Generic Desktop (0x01)".to_string()];
+        if has_dial {
+            details.push("Usage: Dial (0x0037)".to_string());
+        }
+        if has_wheel {
+            details.push("Usage: Wheel (0x0038)".to_string());
+        }
+        return KnobReport {
+            source: KnobModeSource::GenericDesktopDial,
+            description: "Generic Desktop Dial/Wheel (Relative Rotary Encoder)".to_string(),
+            details,
+        };
+    }
+
+    KnobReport {
+        source: KnobModeSource::Undetermined,
+        description: "undetermined, needs live USB capture".to_string(),
+        details: vec![
+            "Report descriptor contains no unambiguous Consumer Control volume or Dial/Wheel usages"
+                .to_string(),
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,6 +620,63 @@ mod tests {
         }
 
         assert_eq!(seen_slots.len(), KEY_SLOTS.len());
+    }
+
+    #[test]
+    fn test_hid_get_feature_safety_guard_rejects_report_5() {
+        let mut buf = [0u8; 64];
+        let res = hid_get_feature(-1, 5, &mut buf);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("report ID 5"));
+    }
+
+    #[test]
+    fn test_hid_get_feature_empty_buffer_rejects() {
+        let res = hid_get_feature(-1, 6, &mut []);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_parse_knob_consumer_control() {
+        // Usage Page (Consumer 0x0C), Usage (Volume Increment 0xE9), Usage (Volume Decrement 0xEA)
+        let desc = [
+            0x05, 0x0C, // Usage Page (Consumer)
+            0x09, 0xE9, // Usage (Volume Increment)
+            0x09, 0xEA, // Usage (Volume Decrement)
+            0x09, 0xE2, // Usage (Mute)
+        ];
+        let report = parse_knob_from_report_descriptor(&desc);
+        assert_eq!(report.source, KnobModeSource::ConsumerControl);
+        assert!(report.description.contains("Consumer Control"));
+        assert!(report.details.iter().any(|d| d.contains("Volume Increment")));
+    }
+
+    #[test]
+    fn test_parse_knob_generic_desktop_dial() {
+        // Usage Page (Generic Desktop 0x01), Usage (Dial 0x37)
+        let desc = [
+            0x05, 0x01, // Usage Page (Generic Desktop)
+            0x09, 0x37, // Usage (Dial)
+        ];
+        let report = parse_knob_from_report_descriptor(&desc);
+        assert_eq!(report.source, KnobModeSource::GenericDesktopDial);
+        assert!(report.description.contains("Dial"));
+    }
+
+    #[test]
+    fn test_parse_knob_empty_and_undetermined() {
+        let empty_report = parse_knob_from_report_descriptor(&[]);
+        assert_eq!(empty_report.source, KnobModeSource::Undetermined);
+        assert_eq!(empty_report.description, "undetermined, needs live USB capture");
+
+        // Keyboard-only descriptor (Usage Page Generic Desktop 0x01, Usage Keyboard 0x06)
+        let kbd_desc = [0x05, 0x01, 0x09, 0x06];
+        let kbd_report = parse_knob_from_report_descriptor(&kbd_desc);
+        assert_eq!(kbd_report.source, KnobModeSource::Undetermined);
+        assert_eq!(kbd_report.description, "undetermined, needs live USB capture");
     }
 }
 

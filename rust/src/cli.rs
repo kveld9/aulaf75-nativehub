@@ -21,6 +21,9 @@ pub mod music;
 
 pub use music::{AudioConfig, MusicMode};
 
+pub use crate::device::power;
+pub use crate::device::power::BatteryStatus;
+
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
 extern "C" fn sigint_handler(_: libc::c_int) {
@@ -174,6 +177,12 @@ pub enum Commands {
         #[arg(long)]
         seconds: Option<f64>,
     },
+    /// Query battery status via sysfs power supply and safe HID read
+    Battery,
+    /// Detect 2.4GHz wireless dongle vs wired cable connection topology
+    Wireless,
+    /// Report currently observed multifunction knob mode and HID usage source
+    Knob,
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -288,6 +297,23 @@ pub fn cmd_info(
         println!("  Release:       0x{:04x}", dev.release_number);
         println!("  Usage Page:    0x{:04x}", dev.usage_page);
         println!("  Usage:         0x{:04x}", dev.usage);
+        println!(
+            "  USB Parent:    {}",
+            if dev.usb_parent.is_empty() {
+                "N/A"
+            } else {
+                &dev.usb_parent
+            }
+        );
+        println!(
+            "  Phys:          {}",
+            if dev.phys.is_empty() {
+                "N/A"
+            } else {
+                &dev.phys
+            }
+        );
+        println!("  Connection:    {:?}", dev.classify_connection());
     }
 
     0
@@ -528,6 +554,112 @@ pub fn run_music_lighting(
     }
 }
 
+/// Query and report battery status via sysfs power supply and safe HID read.
+pub fn cmd_battery() -> i32 {
+    let sys_class_hidraw = Path::new("/sys/class/hidraw");
+    let devices = device::enumerate_devices(sys_class_hidraw);
+    let aula_devs: Vec<&device::DeviceInfo> = devices.iter().filter(|d| d.is_known).collect();
+
+    if aula_devs.is_empty() {
+        eprintln!("Error: AULA F75 device not detected.");
+        return 1;
+    }
+
+    println!("Querying AULA F75 battery status...");
+
+    let sysfs_power = Path::new("/sys/class/power_supply");
+    let status = power::query_sysfs_battery_for_device(sysfs_power, Some("258A:010C"));
+
+    if status.present && status.percent.is_some() {
+        println!("Battery Status:");
+        println!("  Present:       Yes");
+        println!("  Level:         {}%", status.percent.unwrap());
+        if let Some(chg) = status.charging {
+            println!(
+                "  State:         {}",
+                if chg {
+                    "Charging"
+                } else {
+                    "Discharging / Not charging"
+                }
+            );
+        }
+    } else {
+        println!("Battery Status:  Not reported by device");
+        println!("  Detail:        No sysfs power_supply or battery telemetry exposed in wired USB mode (258a:010c).");
+        println!("  Note:          Requires live USB capture in 2.4GHz wireless / Bluetooth mode.");
+    }
+
+    0
+}
+
+/// Detect 2.4GHz wireless dongle vs direct cable connection topology.
+pub fn cmd_wireless() -> i32 {
+    let sys_class_hidraw = Path::new("/sys/class/hidraw");
+    let candidates = device::enumerate_wireless_nodes_with_roots(sys_class_hidraw);
+
+    if candidates.is_empty() {
+        eprintln!("Error: AULA F75 device not detected.");
+        return 1;
+    }
+
+    println!("AULA F75 USB Connection & Dongle Detection:");
+    let mut dongle_found = false;
+    for (i, c) in candidates.iter().enumerate() {
+        if c.is_dongle {
+            dongle_found = true;
+        }
+        let iface_str = c
+            .interface_number
+            .map(|n| format!("Interface {}", n))
+            .unwrap_or_else(|| "Interface N/A".to_string());
+        println!("  Candidate #{}: {} ({})", i + 1, c.path.display(), iface_str);
+        println!(
+            "    USB Parent:    {}",
+            if c.usb_parent.is_empty() {
+                "N/A"
+            } else {
+                &c.usb_parent
+            }
+        );
+        println!(
+            "    Phys:          {}",
+            if c.phys.is_empty() { "N/A" } else { &c.phys }
+        );
+        println!("    Classification: {:?}", c.connection_kind);
+        println!("    Detail:        {}", c.detail);
+    }
+
+    println!();
+    if dongle_found {
+        println!("Summary: 2.4GHz wireless dongle receiver detected.");
+    } else {
+        println!("Summary: Direct USB cable connection active (no 2.4GHz dongle detected).");
+    }
+
+    0
+}
+
+/// Report currently observed multifunction knob mode.
+pub fn cmd_knob() -> i32 {
+    let sys_class_hidraw = Path::new("/sys/class/hidraw");
+    let devices = device::enumerate_devices(sys_class_hidraw);
+    if !devices.iter().any(|d| d.is_known) {
+        eprintln!("Error: AULA F75 device not detected.");
+        return 1;
+    }
+
+    let report = device::query_knob_mode_with_roots(sys_class_hidraw);
+    println!("AULA F75 Multifunction Knob Mode:");
+    println!("  Behavior Source: {:?}", report.source);
+    println!("  Description:     {}", report.description);
+    for detail in &report.details {
+        println!("  - {}", detail);
+    }
+
+    0
+}
+
 /// Execute CLI commands and return exit code.
 pub fn run() -> i32 {
     let cli = Cli::parse();
@@ -659,6 +791,9 @@ pub fn run() -> i32 {
             let clamped_gain = gain.max(0.01);
             run_music_lighting(parsed_mode, parsed_color, clamped_gain, seconds)
         }
+        Commands::Battery => cmd_battery(),
+        Commands::Wireless => cmd_wireless(),
+        Commands::Knob => cmd_knob(),
     }
 }
 
@@ -1091,6 +1226,27 @@ mod tests {
             }
             _ => panic!("Expected Commands::Music"),
         }
+    }
+
+    #[test]
+    fn test_cli_subcommand_battery_parse() {
+        let parsed = Cli::try_parse_from(["aula-f75-rs", "battery"]);
+        assert!(parsed.is_ok());
+        assert!(matches!(parsed.unwrap().command, Commands::Battery));
+    }
+
+    #[test]
+    fn test_cli_subcommand_wireless_parse() {
+        let parsed = Cli::try_parse_from(["aula-f75-rs", "wireless"]);
+        assert!(parsed.is_ok());
+        assert!(matches!(parsed.unwrap().command, Commands::Wireless));
+    }
+
+    #[test]
+    fn test_cli_subcommand_knob_parse() {
+        let parsed = Cli::try_parse_from(["aula-f75-rs", "knob"]);
+        assert!(parsed.is_ok());
+        assert!(matches!(parsed.unwrap().command, Commands::Knob));
     }
 }
 
