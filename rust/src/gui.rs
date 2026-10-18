@@ -1186,6 +1186,8 @@ pub struct AulaF75App {
     pub hex_error: Option<String>,
     /// Global brightness factor (0.0 to 1.0).
     pub brightness: f32,
+    /// Animation speed multiplier (0.25 to 3.0, default 1.0).
+    pub effect_speed: f32,
     /// Selected effect name.
     pub selected_effect: String,
 
@@ -1237,6 +1239,7 @@ impl Default for AulaF75App {
             hex_input: initial_hex,
             hex_error: None,
             brightness: 1.0,
+            effect_speed: 1.0,
             selected_effect: "Solid".to_string(),
             control_node_path: None,
             status_text: "Connecting...".to_string(),
@@ -1403,13 +1406,24 @@ impl AulaF75App {
     /// Build current `Effect` based on GUI state.
     pub fn current_effect(&self) -> Effect {
         let base_color = RGB(self.color_rgb[0], self.color_rgb[1], self.color_rgb[2]);
+        let speed = if self.effect_speed.is_nan() {
+            1.0
+        } else {
+            self.effect_speed.clamp(0.25, 3.0)
+        };
+        let speed = if speed <= 0.0 { 1.0 } else { speed as f64 };
+
         match self.selected_effect.to_ascii_lowercase().as_str() {
             "solid" => Effect::Solid(base_color),
-            "rainbow" => Effect::Rainbow { period_s: 5.0 },
-            "wave" => Effect::Wave { period_s: 3.0 },
+            "rainbow" => Effect::Rainbow {
+                period_s: 5.0 / speed,
+            },
+            "wave" => Effect::Wave {
+                period_s: 3.0 / speed,
+            },
             "breathe" => Effect::Breathe {
                 color: base_color,
-                period_s: 4.0,
+                period_s: 4.0 / speed,
             },
             "stars" => Effect::Stars { density: 0.15 },
             _ => Effect::Off,
@@ -2182,6 +2196,33 @@ impl eframe::App for AulaF75App {
                         }
                     }
                 });
+
+                // Speed slider (visible only for effects supporting animation speed: Rainbow, Wave, Breathe)
+                let is_speed_effect = self.selected_effect == "Rainbow"
+                    || self.selected_effect == "Wave"
+                    || self.selected_effect == "Breathe"
+                    || self.selected_effect.eq_ignore_ascii_case("rainbow")
+                    || self.selected_effect.eq_ignore_ascii_case("wave")
+                    || self.selected_effect.eq_ignore_ascii_case("breathe");
+                if is_speed_effect {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Speed:")
+                                .size(12.0)
+                                .color(COLOR_TEXT_SECONDARY),
+                        );
+                        let speed_label = format!("{:.1}x", self.effect_speed);
+                        if ui
+                            .add(egui::Slider::new(&mut self.effect_speed, 0.25..=3.0).text(speed_label))
+                            .changed()
+                        {
+                            if self.is_streaming() {
+                                self.dispatch_current_effect();
+                            }
+                        }
+                    });
+                }
 
                 ui.add_space(10.0);
 

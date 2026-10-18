@@ -580,3 +580,194 @@ fn test_connection_badge_state_transitions() {
     assert_eq!(state.label(), "Connecting...");
 }
 
+#[test]
+fn test_gui_default_effect_speed_is_one() {
+    let app = AulaF75App::default();
+    assert_eq!(app.effect_speed, 1.0);
+}
+
+#[test]
+fn test_gui_current_effect_period_mapping_default_speed() {
+    let mut app = AulaF75App::default();
+    app.color_rgb = [255, 0, 128];
+
+    // Default speed 1.0 keeps rainbow: 5.0s, wave: 3.0s, breathe: 4.0s
+    app.selected_effect = "Rainbow".to_string();
+    assert_eq!(app.current_effect(), Effect::Rainbow { period_s: 5.0 });
+
+    app.selected_effect = "Wave".to_string();
+    assert_eq!(app.current_effect(), Effect::Wave { period_s: 3.0 });
+
+    app.selected_effect = "Breathe".to_string();
+    assert_eq!(
+        app.current_effect(),
+        Effect::Breathe {
+            color: aula_f75::effects::RGB(255, 0, 128),
+            period_s: 4.0,
+        }
+    );
+
+    // Solid, Stars, Off are unchanged by speed
+    app.selected_effect = "Solid".to_string();
+    assert_eq!(
+        app.current_effect(),
+        Effect::Solid(aula_f75::effects::RGB(255, 0, 128))
+    );
+
+    app.selected_effect = "Stars".to_string();
+    assert_eq!(app.current_effect(), Effect::Stars { density: 0.15 });
+
+    app.selected_effect = "Off".to_string();
+    assert_eq!(app.current_effect(), Effect::Off);
+}
+
+#[test]
+fn test_gui_current_effect_speed_multiplier_halves_periods() {
+    let mut app = AulaF75App::default();
+    app.effect_speed = 2.0;
+    app.color_rgb = [0, 255, 0];
+
+    // Speed 2.0 halves periods: rainbow 5.0 / 2.0 = 2.5s, wave 3.0 / 2.0 = 1.5s, breathe 4.0 / 2.0 = 2.0s
+    app.selected_effect = "Rainbow".to_string();
+    assert_eq!(app.current_effect(), Effect::Rainbow { period_s: 2.5 });
+
+    app.selected_effect = "Wave".to_string();
+    assert_eq!(app.current_effect(), Effect::Wave { period_s: 1.5 });
+
+    app.selected_effect = "Breathe".to_string();
+    assert_eq!(
+        app.current_effect(),
+        Effect::Breathe {
+            color: aula_f75::effects::RGB(0, 255, 0),
+            period_s: 2.0,
+        }
+    );
+
+    // Non-speed effects unaffected
+    app.selected_effect = "Stars".to_string();
+    assert_eq!(app.current_effect(), Effect::Stars { density: 0.15 });
+
+    app.selected_effect = "Solid".to_string();
+    assert_eq!(
+        app.current_effect(),
+        Effect::Solid(aula_f75::effects::RGB(0, 255, 0))
+    );
+}
+
+#[test]
+fn test_gui_current_effect_speed_clamping_and_guards() {
+    let mut app = AulaF75App::default();
+
+    // Below 0.25 clamps to 0.25 (5.0 / 0.25 = 20.0s, 3.0 / 0.25 = 12.0s)
+    app.effect_speed = 0.1;
+    app.selected_effect = "Rainbow".to_string();
+    assert_eq!(app.current_effect(), Effect::Rainbow { period_s: 20.0 });
+    app.selected_effect = "Wave".to_string();
+    assert_eq!(app.current_effect(), Effect::Wave { period_s: 12.0 });
+
+    // Above 3.0 clamps to 3.0 (3.0 / 3.0 = 1.0s)
+    app.effect_speed = 5.0;
+    app.selected_effect = "Wave".to_string();
+    assert_eq!(app.current_effect(), Effect::Wave { period_s: 1.0 });
+
+    // Zero clamps to 0.25 without division by zero
+    app.effect_speed = 0.0;
+    app.selected_effect = "Rainbow".to_string();
+    assert_eq!(app.current_effect(), Effect::Rainbow { period_s: 20.0 });
+
+    // NaN defaults safely to 1.0
+    app.effect_speed = f32::NAN;
+    app.selected_effect = "Rainbow".to_string();
+    assert_eq!(app.current_effect(), Effect::Rainbow { period_s: 5.0 });
+}
+
+#[test]
+fn test_gui_dispatch_current_effect_with_speed() {
+    let mut app = AulaF75App::default();
+    let (tx, rx) = mpsc::channel();
+    app.worker_tx = Some(tx);
+    // Mark worker running via mock handle
+    let handle = std::thread::spawn(|| {});
+    app.worker_handle = Some(handle);
+
+    app.effect_speed = 2.0;
+    app.selected_effect = "Wave".to_string();
+    app.dispatch_current_effect();
+
+    let received = rx.recv_timeout(Duration::from_millis(200)).unwrap();
+    assert_eq!(
+        received,
+        WorkerMessage::SetEffect {
+            effect: Effect::Wave { period_s: 1.5 },
+            brightness: 1.0,
+        }
+    );
+
+    let _ = app.worker_handle.take().unwrap().join();
+}
+
+#[test]
+fn test_cli_fx_speed_parsing_and_defaults() {
+    use aula_f75::cli::{Cli, Commands};
+    use clap::Parser;
+
+    // Default speed is 1.0
+    let parsed_default = Cli::try_parse_from(["aula-f75-rs", "fx", "rainbow"]).unwrap();
+    if let Commands::Fx { speed, .. } = parsed_default.command {
+        assert_eq!(speed, 1.0);
+    } else {
+        panic!("Expected Commands::Fx");
+    }
+
+    // Explicit --speed
+    let parsed_custom = Cli::try_parse_from(["aula-f75-rs", "fx", "wave", "--speed", "2.0"]).unwrap();
+    if let Commands::Fx { speed, .. } = parsed_custom.command {
+        assert_eq!(speed, 2.0);
+    } else {
+        panic!("Expected Commands::Fx");
+    }
+}
+
+#[test]
+fn test_cli_fx_speed_validation() {
+    use aula_f75::cli::validate_effect_speed;
+
+    assert!(validate_effect_speed(0.25).is_ok());
+    assert!(validate_effect_speed(1.0).is_ok());
+    assert!(validate_effect_speed(3.0).is_ok());
+
+    assert!(validate_effect_speed(0.24).is_err());
+    assert!(validate_effect_speed(3.01).is_err());
+    assert!(validate_effect_speed(-0.5).is_err());
+    assert!(validate_effect_speed(f32::NAN).is_err());
+}
+
+#[test]
+fn test_effects_from_name_with_speed_halves_periods() {
+    use aula_f75::effects::{Effect, RGB};
+
+    let rainbow_half = Effect::from_name_with_speed("rainbow", None, 2.0).unwrap();
+    assert_eq!(rainbow_half, Effect::Rainbow { period_s: 2.5 });
+
+    let wave_half = Effect::from_name_with_speed("wave", None, 2.0).unwrap();
+    assert_eq!(wave_half, Effect::Wave { period_s: 1.5 });
+
+    let breathe_half = Effect::from_name_with_speed("breathe", Some(RGB(255, 0, 0)), 2.0).unwrap();
+    assert_eq!(
+        breathe_half,
+        Effect::Breathe {
+            color: RGB(255, 0, 0),
+            period_s: 2.0,
+        }
+    );
+
+    let solid = Effect::from_name_with_speed("solid", Some(RGB(10, 20, 30)), 2.0).unwrap();
+    assert_eq!(solid, Effect::Solid(RGB(10, 20, 30)));
+
+    let stars = Effect::from_name_with_speed("stars", None, 2.0).unwrap();
+    assert_eq!(stars, Effect::Stars { density: 0.15 });
+
+    let off = Effect::from_name_with_speed("off", None, 2.0).unwrap();
+    assert_eq!(off, Effect::Off);
+}
+

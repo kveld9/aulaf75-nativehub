@@ -151,6 +151,9 @@ pub enum Commands {
         /// Brightness multiplier (0.0 to 1.0)
         #[arg(long, default_value_t = 1.0)]
         brightness: f32,
+        /// Animation speed multiplier (0.25 to 3.0)
+        #[arg(long, default_value_t = 1.0)]
+        speed: f32,
         /// Duration to run effect in seconds (0 or omitted = run until Ctrl+C)
         #[arg(long)]
         seconds: Option<f64>,
@@ -419,6 +422,15 @@ pub fn cmd_effects() -> i32 {
     println!("  stars:   Deterministic twinkling starry night across keys");
     println!("  off:     Turn off RGB lighting");
     0
+}
+
+/// Validate animation speed multiplier is within acceptable range `0.25..=3.0`.
+pub fn validate_effect_speed(speed: f32) -> Result<f32, String> {
+    if speed < 0.25 || speed > 3.0 || speed.is_nan() {
+        Err(format!("Speed must be between 0.25 and 3.0 (got {})", speed))
+    } else {
+        Ok(speed)
+    }
 }
 
 /// Run host-rendered RGB effect streaming loop on the hardware interface 1 control node.
@@ -728,8 +740,14 @@ pub fn run() -> i32 {
             name,
             color,
             brightness,
+            speed,
             seconds,
         } => {
+            if let Err(e) = validate_effect_speed(speed) {
+                eprintln!("Error: {}", e);
+                return 2;
+            }
+
             let lower_name = name.trim().to_ascii_lowercase();
             if (lower_name == "solid" || lower_name == "breathe") && color.is_none() {
                 eprintln!("Error: Effect '{}' requires --color RRGGBB", name);
@@ -755,7 +773,7 @@ pub fn run() -> i32 {
                 None => None,
             };
 
-            let effect = match crate::effects::Effect::from_name(&name, parsed_color) {
+            let effect = match crate::effects::Effect::from_name_with_speed(&name, parsed_color, speed) {
                 Ok(eff) => eff,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -1040,12 +1058,14 @@ mod tests {
             name,
             color,
             brightness,
+            speed,
             seconds,
         } = parsed.unwrap().command
         {
             assert_eq!(name, "rainbow");
             assert_eq!(color, None);
             assert_eq!(brightness, 0.8);
+            assert_eq!(speed, 1.0);
             assert_eq!(seconds, Some(10.0));
         } else {
             panic!("Expected Commands::Fx");
@@ -1063,13 +1083,35 @@ mod tests {
             name,
             color,
             brightness,
+            speed,
             seconds,
         } = parsed_breathe.unwrap().command
         {
             assert_eq!(name, "breathe");
             assert_eq!(color, Some("ff00ff".to_string()));
             assert_eq!(brightness, 1.0);
+            assert_eq!(speed, 1.0);
             assert_eq!(seconds, None);
+        } else {
+            panic!("Expected Commands::Fx");
+        }
+
+        let parsed_speed = Cli::try_parse_from([
+            "aula-f75-rs",
+            "fx",
+            "wave",
+            "--speed",
+            "2.5",
+        ]);
+        assert!(parsed_speed.is_ok());
+        if let Commands::Fx {
+            name,
+            speed,
+            ..
+        } = parsed_speed.unwrap().command
+        {
+            assert_eq!(name, "wave");
+            assert_eq!(speed, 2.5);
         } else {
             panic!("Expected Commands::Fx");
         }

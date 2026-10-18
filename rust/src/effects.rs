@@ -79,21 +79,35 @@ pub enum Effect {
 }
 
 impl Effect {
-    /// Construct an effect from a case-insensitive name string and optional base color.
-    pub fn from_name(name: &str, color: Option<RGB>) -> Result<Effect, String> {
+    /// Construct an effect from a case-insensitive name string, optional base color, and animation speed multiplier.
+    ///
+    /// The speed multiplier is clamped to `0.25..=3.0` and scales periods for `rainbow` (5.0 / speed),
+    /// `wave` (3.0 / speed), and `breathe` (4.0 / speed).
+    pub fn from_name_with_speed(name: &str, color: Option<RGB>, speed: f32) -> Result<Effect, String> {
+        let sp = if speed.is_nan() {
+            1.0
+        } else {
+            speed.clamp(0.25, 3.0)
+        };
+        let sp = if sp <= 0.0 { 1.0 } else { sp as f64 };
+
         let trimmed = name.trim().to_ascii_lowercase();
         match trimmed.as_str() {
             "solid" => {
                 let c = color.ok_or_else(|| "Effect 'solid' requires --color RRGGBB".to_string())?;
                 Ok(Effect::Solid(c))
             }
-            "rainbow" => Ok(Effect::Rainbow { period_s: 5.0 }),
-            "wave" => Ok(Effect::Wave { period_s: 3.0 }),
+            "rainbow" => Ok(Effect::Rainbow {
+                period_s: 5.0 / sp,
+            }),
+            "wave" => Ok(Effect::Wave {
+                period_s: 3.0 / sp,
+            }),
             "breathe" => {
                 let c = color.ok_or_else(|| "Effect 'breathe' requires --color RRGGBB".to_string())?;
                 Ok(Effect::Breathe {
                     color: c,
-                    period_s: 4.0,
+                    period_s: 4.0 / sp,
                 })
             }
             "stars" => Ok(Effect::Stars { density: 0.15 }),
@@ -103,6 +117,11 @@ impl Effect {
                 name
             )),
         }
+    }
+
+    /// Construct an effect from a case-insensitive name string and optional base color with default speed (1.0).
+    pub fn from_name(name: &str, color: Option<RGB>) -> Result<Effect, String> {
+        Self::from_name_with_speed(name, color, 1.0)
     }
 }
 
