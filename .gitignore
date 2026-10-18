@@ -20,3 +20,9 @@ captures/
 
 # Rust build target
 target/
+
+# Convenience rules
+.DS_Store
+*.swp
+.idea/
+.vscode/

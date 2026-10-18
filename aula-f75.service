@@ -1,6 +1,5 @@
 [Unit]
 Description=AULA F75 RGB Lighting Service
-Documentation=https://github.com/
 After=default.target
 
 [Service]

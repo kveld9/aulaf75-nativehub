@@ -524,7 +524,8 @@ pub fn run_worker_stream<F, S>(
                 Err(e) => {
                     let _ =
                         status_tx.send(WorkerStatus::Error(format!("Frame build error: {}", e)));
-                    break;
+                    current_keys = None;
+                    continue;
                 }
             }
         } else {
@@ -612,6 +613,7 @@ pub fn run_worker_stream<F, S>(
                     music_child = None;
                     current_keys = None;
                     current_effect = Effect::Solid(RGB(new_color.0, new_color.1, new_color.2));
+                    current_brightness = 1.0;
                     break;
                 }
                 Ok(WorkerMessage::SetEffect { effect, brightness }) => {
@@ -1024,7 +1026,7 @@ pub fn run_worker_reconnect_loop<R, O, D, F, S, I>(
                 Ok(f) => f,
                 Err(e) => {
                     let _ = status_tx.send(WorkerStatus::Error(e));
-                    active_device = None;
+                    current_keys = None;
                     continue 'outer;
                 }
             }
@@ -1099,6 +1101,7 @@ pub fn run_worker_reconnect_loop<R, O, D, F, S, I>(
                     music_child = None;
                     current_keys = None;
                     current_effect = Effect::Solid(RGB(new_color.0, new_color.1, new_color.2));
+                    current_brightness = 1.0;
                     break;
                 }
                 Ok(WorkerMessage::SetEffect { effect, brightness }) => {
@@ -1406,28 +1409,8 @@ impl AulaF75App {
     /// Build current `Effect` based on GUI state.
     pub fn current_effect(&self) -> Effect {
         let base_color = RGB(self.color_rgb[0], self.color_rgb[1], self.color_rgb[2]);
-        let speed = if self.effect_speed.is_nan() {
-            1.0
-        } else {
-            self.effect_speed.clamp(0.25, 3.0)
-        };
-        let speed = if speed <= 0.0 { 1.0 } else { speed as f64 };
-
-        match self.selected_effect.to_ascii_lowercase().as_str() {
-            "solid" => Effect::Solid(base_color),
-            "rainbow" => Effect::Rainbow {
-                period_s: 5.0 / speed,
-            },
-            "wave" => Effect::Wave {
-                period_s: 3.0 / speed,
-            },
-            "breathe" => Effect::Breathe {
-                color: base_color,
-                period_s: 4.0 / speed,
-            },
-            "stars" => Effect::Stars { density: 0.15 },
-            _ => Effect::Off,
-        }
+        Effect::from_name_with_speed(&self.selected_effect, Some(base_color), self.effect_speed)
+            .unwrap_or(Effect::Off)
     }
 
     /// Dispatch current effect and brightness to running worker or start a new worker.
@@ -1647,6 +1630,7 @@ impl AulaF75App {
             };
             self.selected_effect = effect_name.to_string();
             self.brightness = prof.brightness;
+            self.effect_speed = prof.speed;
             if let Some(c) = prof.color {
                 self.color_rgb = [c.0, c.1, c.2];
                 self.hex_input = format!("{:02X}{:02X}{:02X}", c.0, c.1, c.2);
@@ -1718,11 +1702,12 @@ impl AulaF75App {
             None
         };
 
-        let prof = Profile::new(
+        let prof = Profile::new_with_speed(
             name.to_string(),
             self.selected_effect.to_ascii_lowercase(),
             color,
             self.brightness,
+            self.effect_speed,
             Vec::new(),
         );
 
@@ -2551,3 +2536,286 @@ impl eframe::App for AulaF75App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn test_worker_stream_set_color_after_zero_brightness_effect() {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (status_tx, _status_rx) = mpsc::channel();
+
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let sent_frames_clone = sent_frames.clone();
+
+        let handle = std::thread::spawn(move || {
+            run_worker_stream(
+                cmd_rx,
+                status_tx,
+                WorkerMessage::SetEffect {
+                    effect: Effect::Rainbow { period_s: 5.0 },
+                    brightness: 0.0,
+                },
+                Duration::from_millis(20),
+                move |frame| {
+                    sent_frames_clone.lock().unwrap().push(*frame);
+                    Ok(())
+                },
+                |_| {},
+            );
+        });
+
+        // Wait for initial effect frame with brightness 0.0
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            if !sent_frames.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Send SetColor((255, 0, 0))
+        cmd_tx.send(WorkerMessage::SetColor((255, 0, 0))).unwrap();
+
+        // Wait until solid frame with [255, 0, 0] is emitted
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            let frames = sent_frames.lock().unwrap();
+            if let Some(last) = frames.last() {
+                if &last[8..11] == &[255, 0, 0] {
+                    break;
+                }
+            }
+            drop(frames);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let _ = cmd_tx.send(WorkerMessage::Stop);
+        drop(cmd_tx);
+        handle.join().expect("Worker thread panicked");
+
+        let frames = sent_frames.lock().unwrap();
+        assert!(!frames.is_empty());
+        let last_frame = frames.last().unwrap();
+        assert_eq!(&last_frame[8..11], &[255, 0, 0]);
+    }
+
+    #[test]
+    fn test_worker_reconnect_loop_set_color_resets_brightness() {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (status_tx, _status_rx) = mpsc::channel();
+
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let sent_frames_clone = sent_frames.clone();
+
+        let handle = std::thread::spawn(move || {
+            run_worker_reconnect_loop(
+                cmd_rx,
+                status_tx,
+                WorkerMessage::SetEffect {
+                    effect: Effect::Rainbow { period_s: 5.0 },
+                    brightness: 0.0,
+                },
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+                || Some(PathBuf::from("/dev/fake_node")),
+                |_path| Ok(()),
+                move |_dev, frame| {
+                    sent_frames_clone.lock().unwrap().push(*frame);
+                    Ok(())
+                },
+                |_| {},
+            );
+        });
+
+        // Wait for initial effect frame
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            if !sent_frames.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Send SetColor((255, 0, 0))
+        cmd_tx.send(WorkerMessage::SetColor((255, 0, 0))).unwrap();
+
+        // Wait until solid frame with [255, 0, 0] is emitted
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            let frames = sent_frames.lock().unwrap();
+            if let Some(last) = frames.last() {
+                if &last[8..11] == &[255, 0, 0] {
+                    break;
+                }
+            }
+            drop(frames);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let _ = cmd_tx.send(WorkerMessage::Stop);
+        drop(cmd_tx);
+        handle.join().expect("Worker thread panicked");
+
+        let frames = sent_frames.lock().unwrap();
+        assert!(!frames.is_empty());
+        let last_frame = frames.last().unwrap();
+        assert_eq!(&last_frame[8..11], &[255, 0, 0]);
+    }
+
+    #[test]
+    fn test_worker_stream_survives_bad_key_frame() {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (status_tx, status_rx) = mpsc::channel();
+
+        let sent_frames = Arc::new(Mutex::new(Vec::new()));
+        let sent_frames_clone = sent_frames.clone();
+
+        let handle = std::thread::spawn(move || {
+            run_worker_stream(
+                cmd_rx,
+                status_tx,
+                WorkerMessage::SetColor((10, 20, 30)),
+                Duration::from_millis(20),
+                move |frame| {
+                    sent_frames_clone.lock().unwrap().push(*frame);
+                    Ok(())
+                },
+                |_| {},
+            );
+        });
+
+        // Wait for initial frame
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            if !sent_frames.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Send SetKeyFrame with an unknown key name
+        cmd_tx
+            .send(WorkerMessage::SetKeyFrame(vec![(
+                "completely_invalid_key_alias".to_string(),
+                (255, 0, 0),
+            )]))
+            .unwrap();
+
+        // Poll for error status
+        let start = Instant::now();
+        let mut got_error = false;
+        while start.elapsed() < Duration::from_millis(500) {
+            while let Ok(status) = status_rx.try_recv() {
+                if let WorkerStatus::Error(msg) = status {
+                    if msg.contains("Frame build error") || msg.contains("Unknown key name") {
+                        got_error = true;
+                    }
+                }
+            }
+            if got_error {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(got_error, "Expected WorkerStatus::Error on bad key");
+
+        // Worker must still be alive! Send valid color
+        cmd_tx.send(WorkerMessage::SetColor((40, 50, 60))).unwrap();
+
+        // Wait for updated frame
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            let frames = sent_frames.lock().unwrap();
+            if let Some(last) = frames.last() {
+                if &last[8..11] == &[40, 50, 60] {
+                    break;
+                }
+            }
+            drop(frames);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let _ = cmd_tx.send(WorkerMessage::Stop);
+        drop(cmd_tx);
+        handle.join().expect("Worker thread panicked");
+
+        let frames = sent_frames.lock().unwrap();
+        assert!(!frames.is_empty());
+        let last_frame = frames.last().unwrap();
+        assert_eq!(&last_frame[8..11], &[40, 50, 60]);
+    }
+
+    #[test]
+    fn test_worker_reconnect_loop_retains_active_device_on_bad_key() {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (status_tx, status_rx) = mpsc::channel();
+
+        let open_count = Arc::new(AtomicUsize::new(0));
+        let open_count_clone = open_count.clone();
+
+        let handle = std::thread::spawn(move || {
+            run_worker_reconnect_loop(
+                cmd_rx,
+                status_tx,
+                WorkerMessage::SetColor((10, 20, 30)),
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+                || Some(PathBuf::from("/dev/fake_node")),
+                move |_path| {
+                    open_count_clone.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                |_dev, _frame| Ok(()),
+                |_| {},
+            );
+        });
+
+        // Wait for device to open
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            if open_count.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(open_count.load(Ordering::SeqCst), 1);
+
+        // Send bad key
+        cmd_tx
+            .send(WorkerMessage::SetKeyFrame(vec![(
+                "unknown_key_xyz".to_string(),
+                (255, 0, 0),
+            )]))
+            .unwrap();
+
+        // Poll for error status
+        let start = Instant::now();
+        let mut got_error = false;
+        while start.elapsed() < Duration::from_millis(500) {
+            while let Ok(status) = status_rx.try_recv() {
+                if let WorkerStatus::Error(msg) = status {
+                    if msg.contains("Frame build error") || msg.contains("Unknown key name") {
+                        got_error = true;
+                    }
+                }
+            }
+            if got_error {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(got_error);
+
+        // active_device was NOT dropped, so open_fn was not called again
+        assert_eq!(open_count.load(Ordering::SeqCst), 1);
+
+        let _ = cmd_tx.send(WorkerMessage::Stop);
+        drop(cmd_tx);
+        handle.join().expect("Worker thread panicked");
+    }
+}
+

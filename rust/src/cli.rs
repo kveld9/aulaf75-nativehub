@@ -91,7 +91,7 @@ pub fn parse_hex_or_dec(s: &str) -> Result<u16, String> {
 #[derive(Parser, Debug)]
 #[command(
     name = "aula-f75-rs",
-    version = "0.2.0",
+    version,
     about = "Native Linux configuration utility for AULA F75 keyboard"
 )]
 pub struct Cli {
@@ -262,12 +262,27 @@ pub fn cmd_info(
     vid: Option<u16>,
     pid: Option<u16>,
 ) -> i32 {
-    let matched: Vec<&DeviceInfo> = if let Some(p) = path {
-        devices.iter().filter(|d| d.path.to_string_lossy() == p).collect()
-    } else if vid.is_some() && pid.is_some() {
+    let matched: Vec<&DeviceInfo> = if path.is_some() || vid.is_some() || pid.is_some() {
         devices
             .iter()
-            .filter(|d| Some(d.vendor_id) == vid && Some(d.product_id) == pid)
+            .filter(|d| {
+                if let Some(p) = path {
+                    if d.path.to_string_lossy() != p {
+                        return false;
+                    }
+                }
+                if let Some(v) = vid {
+                    if d.vendor_id != v {
+                        return false;
+                    }
+                }
+                if let Some(pi) = pid {
+                    if d.product_id != pi {
+                        return false;
+                    }
+                }
+                true
+            })
             .collect()
     } else {
         devices.iter().filter(|d| d.is_known).collect()
@@ -568,7 +583,7 @@ pub fn run_music_lighting(
 
 /// Query and report battery status via sysfs power supply and safe HID read.
 pub fn cmd_battery() -> i32 {
-    let sys_class_hidraw = Path::new("/sys/class/hidraw");
+    let sys_class_hidraw = Path::new(device::DEFAULT_SYSFS_HIDRAW);
     let devices = device::enumerate_devices(sys_class_hidraw);
     let aula_devs: Vec<&device::DeviceInfo> = devices.iter().filter(|d| d.is_known).collect();
 
@@ -607,7 +622,7 @@ pub fn cmd_battery() -> i32 {
 
 /// Detect 2.4GHz wireless dongle vs direct cable connection topology.
 pub fn cmd_wireless() -> i32 {
-    let sys_class_hidraw = Path::new("/sys/class/hidraw");
+    let sys_class_hidraw = Path::new(device::DEFAULT_SYSFS_HIDRAW);
     let candidates = device::enumerate_wireless_nodes_with_roots(sys_class_hidraw);
 
     if candidates.is_empty() {
@@ -654,7 +669,7 @@ pub fn cmd_wireless() -> i32 {
 
 /// Report currently observed multifunction knob mode.
 pub fn cmd_knob() -> i32 {
-    let sys_class_hidraw = Path::new("/sys/class/hidraw");
+    let sys_class_hidraw = Path::new(device::DEFAULT_SYSFS_HIDRAW);
     let devices = device::enumerate_devices(sys_class_hidraw);
     if !devices.iter().any(|d| d.is_known) {
         eprintln!("Error: AULA F75 device not detected.");
@@ -677,7 +692,7 @@ pub fn run() -> i32 {
     let cli = Cli::parse();
     match cli.command {
         Commands::List => {
-            let devices = device::enumerate_devices(Path::new("/sys/class/hidraw"));
+            let devices = device::enumerate_devices(Path::new(device::DEFAULT_SYSFS_HIDRAW));
             cmd_list(&devices)
         }
         Commands::Info { path, vid, pid } => {
@@ -697,7 +712,7 @@ pub fn run() -> i32 {
                 }
                 None => None,
             };
-            let devices = device::enumerate_devices(Path::new("/sys/class/hidraw"));
+            let devices = device::enumerate_devices(Path::new(device::DEFAULT_SYSFS_HIDRAW));
             cmd_info(&devices, path.as_deref(), parsed_vid, parsed_pid)
         }
         Commands::Solid { color, seconds } => {
@@ -1289,6 +1304,69 @@ mod tests {
         let parsed = Cli::try_parse_from(["aula-f75-rs", "knob"]);
         assert!(parsed.is_ok());
         assert!(matches!(parsed.unwrap().command, Commands::Knob));
+    }
+
+    #[test]
+    fn test_cmd_info_single_filter_and_combinations() {
+        let test_devs = vec![
+            DeviceInfo {
+                vendor_id: 0x258A,
+                product_id: 0x010C,
+                path: std::path::PathBuf::from("/dev/hidraw1"),
+                interface_number: Some(1),
+                manufacturer_string: "AULA".to_string(),
+                product_string: "AULA F75".to_string(),
+                release_number: 1,
+                usage_page: 0xff00,
+                usage: 1,
+                is_known: true,
+                device_name: "AULA F75".to_string(),
+                usb_parent: "1-1".to_string(),
+                phys: "usb-00:00/input1".to_string(),
+            },
+            DeviceInfo {
+                vendor_id: 0x1234,
+                product_id: 0x5678,
+                path: std::path::PathBuf::from("/dev/hidraw2"),
+                interface_number: Some(0),
+                manufacturer_string: "Other".to_string(),
+                product_string: "Other Mouse".to_string(),
+                release_number: 1,
+                usage_page: 1,
+                usage: 2,
+                is_known: false,
+                device_name: "Other Mouse".to_string(),
+                usb_parent: "1-2".to_string(),
+                phys: "usb-00:00/input2".to_string(),
+            },
+        ];
+
+        // 1. Unfiltered query matches known devices (exit 0)
+        assert_eq!(cmd_info(&test_devs, None, None, None), 0);
+
+        // 2. Single filter --vid matching AULA VID (exit 0)
+        assert_eq!(cmd_info(&test_devs, None, Some(0x258A), None), 0);
+
+        // 3. Single filter --vid matching non-existent VID yields no match (exit 1)
+        assert_eq!(cmd_info(&test_devs, None, Some(0x9999), None), 1);
+
+        // 4. Single filter --pid matching AULA PID (exit 0)
+        assert_eq!(cmd_info(&test_devs, None, None, Some(0x010C)), 0);
+
+        // 5. Single filter --pid matching non-existent PID yields no match (exit 1)
+        assert_eq!(cmd_info(&test_devs, None, None, Some(0x9999)), 1);
+
+        // 6. Both --vid and --pid matching AULA (exit 0)
+        assert_eq!(cmd_info(&test_devs, None, Some(0x258A), Some(0x010C)), 0);
+
+        // 7. Both --vid and --pid where one does not match yields no match (exit 1)
+        assert_eq!(cmd_info(&test_devs, None, Some(0x258A), Some(0x9999)), 1);
+
+        // 8. Filter by path matching (exit 0)
+        assert_eq!(cmd_info(&test_devs, Some("/dev/hidraw1"), None, None), 0);
+
+        // 9. Filter by non-existent path yields no match (exit 1)
+        assert_eq!(cmd_info(&test_devs, Some("/dev/hidraw99"), None, None), 1);
     }
 }
 

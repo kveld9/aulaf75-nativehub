@@ -11,8 +11,7 @@ use aula_f75::device::power::{
     read_sysfs_battery, BatteryStatus,
 };
 use aula_f75::device::{
-    enumerate_devices, enumerate_wireless_nodes_with_roots, query_knob_mode_with_roots,
-    DeviceConnectionKind, KNOWN_PID, KNOWN_VID,
+    enumerate_wireless_nodes_with_roots, query_knob_mode_with_roots, DeviceConnectionKind,
 };
 use aula_f75::proto::{
     hid_get_feature, parse_knob_from_report_descriptor, KnobModeSource,
@@ -184,6 +183,31 @@ fn test_query_sysfs_battery_with_subdirectories_and_filter() {
     assert!(status.present);
     assert_eq!(status.percent, Some(95));
     assert_eq!(status.charging, Some(false));
+}
+
+#[test]
+fn test_query_sysfs_battery_filter_bypasses_unrelated_devices() {
+    let guard = TempDirGuard::new("battery_unrelated");
+    let psupply_root = guard.path.join("power_supply");
+    fs::create_dir_all(&psupply_root).unwrap();
+
+    let bat0 = psupply_root.join("BAT0");
+    fs::create_dir_all(&bat0).unwrap();
+    fs::write(bat0.join("capacity"), "50\n").unwrap();
+    fs::write(bat0.join("status"), "Discharging\n").unwrap();
+    fs::write(bat0.join("present"), "1\n").unwrap();
+
+    // Query with filter for AULA F75 must return empty (skipping unrelated BAT0)
+    let filtered_status = query_sysfs_battery_for_device(&psupply_root, Some("258A:010C"));
+    assert!(!filtered_status.present);
+    assert_eq!(filtered_status.percent, None);
+    assert_eq!(filtered_status.charging, None);
+
+    // Query without filter must retain existing behavior and find BAT0
+    let unfiltered_status = query_sysfs_battery_for_device(&psupply_root, None);
+    assert!(unfiltered_status.present);
+    assert_eq!(unfiltered_status.percent, Some(50));
+    assert_eq!(unfiltered_status.charging, Some(false));
 }
 
 #[test]

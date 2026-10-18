@@ -22,6 +22,8 @@ pub struct Profile {
     pub color: Option<(u8, u8, u8)>,
     /// Global brightness factor clamped to `0.0..=1.0`.
     pub brightness: f32,
+    /// Animation speed factor clamped to `0.25..=3.0` (default 1.0).
+    pub speed: f32,
     /// Optional per-key RGB color overrides `[(key_name, (R, G, B))]`.
     pub keys: Vec<(String, (u8, u8, u8))>,
 }
@@ -43,7 +45,7 @@ pub enum AppliedProfileParams {
 }
 
 impl Profile {
-    /// Construct a new Profile instance.
+    /// Construct a new Profile instance with default speed 1.0.
     pub fn new(
         name: impl Into<String>,
         effect: impl Into<String>,
@@ -56,13 +58,40 @@ impl Profile {
             effect: effect.into(),
             color,
             brightness,
+            speed: 1.0,
             keys,
         }
+    }
+
+    /// Construct a new Profile instance with explicit speed.
+    pub fn new_with_speed(
+        name: impl Into<String>,
+        effect: impl Into<String>,
+        color: Option<(u8, u8, u8)>,
+        brightness: f32,
+        speed: f32,
+        keys: Vec<(String, (u8, u8, u8))>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            effect: effect.into(),
+            color,
+            brightness,
+            speed,
+            keys,
+        }
+    }
+
+    /// Builder helper to set speed.
+    pub fn with_speed(mut self, speed: f32) -> Self {
+        self.speed = speed;
+        self
     }
 
     /// Validate profile integrity:
     /// - Name is non-empty and contains no directory separators or traversal
     /// - Brightness is within `0.0..=1.0` and not NaN
+    /// - Speed is within `0.25..=3.0` and not NaN
     /// - Effect name is recognized (solid, rainbow, wave, breathe, stars, off, or custom)
     /// - Solid and breathe effects require a valid base color
     /// - Custom effect requires at least one per-key override
@@ -86,6 +115,13 @@ impl Profile {
             ));
         }
 
+        if !(0.25..=3.0).contains(&self.speed) || self.speed.is_nan() {
+            return Err(format!(
+                "Speed must be between 0.25 and 3.0, got {}",
+                self.speed
+            ));
+        }
+
         let eff_lower = self.effect.trim().to_ascii_lowercase();
         if eff_lower == "custom" {
             if self.keys.is_empty() {
@@ -93,7 +129,7 @@ impl Profile {
             }
         } else {
             let rgb_opt = self.color.map(|c| RGB(c.0, c.1, c.2));
-            Effect::from_name(&eff_lower, rgb_opt)?;
+            Effect::from_name_with_speed(&eff_lower, rgb_opt, self.speed)?;
         }
 
         for (key_name, _) in &self.keys {
@@ -117,6 +153,7 @@ impl Profile {
             out.push_str(&format!("color = {:02X}{:02X}{:02X}\n", c.0, c.1, c.2));
         }
         out.push_str(&format!("brightness = {:.2}\n", self.brightness));
+        out.push_str(&format!("speed = {:.2}\n", self.speed));
         for (k, c) in &self.keys {
             out.push_str(&format!(
                 "key.{} = {:02X}{:02X}{:02X}\n",
@@ -144,7 +181,11 @@ impl Profile {
             Ok(AppliedProfileParams::Keys { pairs, seconds })
         } else {
             let eff_lower = self.effect.trim().to_ascii_lowercase();
-            let effect = Effect::from_name(&eff_lower, self.color.map(|c| RGB(c.0, c.1, c.2)))?;
+            let effect = Effect::from_name_with_speed(
+                &eff_lower,
+                self.color.map(|c| RGB(c.0, c.1, c.2)),
+                self.speed,
+            )?;
             Ok(AppliedProfileParams::Effect {
                 effect,
                 brightness: self.brightness,
@@ -216,6 +257,7 @@ pub fn parse_from_str(content: &str, file_label: &str) -> Result<Profile, String
     let mut effect: Option<String> = None;
     let mut color: Option<(u8, u8, u8)> = None;
     let mut brightness: Option<f32> = None;
+    let mut speed: Option<f32> = None;
     let mut keys: Vec<(String, (u8, u8, u8))> = Vec::new();
 
     for (idx, line) in content.lines().enumerate() {
@@ -258,6 +300,14 @@ pub fn parse_from_str(content: &str, file_label: &str) -> Result<Profile, String
                 )
             })?;
             brightness = Some(b);
+        } else if k.eq_ignore_ascii_case("speed") {
+            let s = v.parse::<f32>().map_err(|e| {
+                format!(
+                    "{}:{}: Invalid speed {:?}: {}",
+                    file_label, line_num, v, e
+                )
+            })?;
+            speed = Some(s);
         } else if let Some(key_name) = k.strip_prefix("key.") {
             let key_name = key_name.trim();
             if key_name.is_empty() {
@@ -289,12 +339,14 @@ pub fn parse_from_str(content: &str, file_label: &str) -> Result<Profile, String
     });
 
     let brightness = brightness.unwrap_or(1.0);
+    let speed = speed.unwrap_or(1.0);
 
     let profile = Profile {
         name,
         effect,
         color,
         brightness,
+        speed,
         keys,
     };
 
@@ -384,4 +436,83 @@ pub fn delete_profile(name: &str, base_dir: Option<&Path>) -> Result<(), String>
     fs::remove_file(&file_path)
         .map_err(|e| format!("Failed to delete profile {}: {}", file_path.display(), e))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_profile_speed_roundtrip() {
+        let prof = Profile::new_with_speed("speedy_wave", "wave", None, 0.9, 2.5, Vec::new());
+        let serialized = prof.serialize_to_string();
+        assert!(serialized.contains("speed = 2.50\n"));
+
+        let parsed = parse_from_str(&serialized, "speedy_wave.toml").expect("Failed to parse");
+        assert_eq!(parsed.name, "speedy_wave");
+        assert_eq!(parsed.effect, "wave");
+        assert_eq!(parsed.speed, 2.5);
+        assert_eq!(parsed.brightness, 0.9);
+    }
+
+    #[test]
+    fn test_profile_backward_compatibility_without_speed() {
+        let legacy_content = "name = legacy_profile\neffect = rainbow\nbrightness = 0.75\n";
+        let parsed =
+            parse_from_str(legacy_content, "legacy.toml").expect("Failed to parse legacy profile");
+        assert_eq!(parsed.name, "legacy_profile");
+        assert_eq!(parsed.effect, "rainbow");
+        assert_eq!(parsed.brightness, 0.75);
+        assert_eq!(parsed.speed, 1.0); // Defaults to 1.0 when missing
+    }
+
+    #[test]
+    fn test_profile_speed_validation_range() {
+        // Valid bounds
+        assert!(Profile::new_with_speed("p", "rainbow", None, 1.0, 0.25, Vec::new())
+            .validate()
+            .is_ok());
+        assert!(Profile::new_with_speed("p", "rainbow", None, 1.0, 1.0, Vec::new())
+            .validate()
+            .is_ok());
+        assert!(Profile::new_with_speed("p", "rainbow", None, 1.0, 3.0, Vec::new())
+            .validate()
+            .is_ok());
+
+        // Out of bounds (< 0.25)
+        assert!(Profile::new_with_speed("p", "rainbow", None, 1.0, 0.24, Vec::new())
+            .validate()
+            .is_err());
+        assert!(Profile::new_with_speed("p", "rainbow", None, 1.0, -1.0, Vec::new())
+            .validate()
+            .is_err());
+
+        // Out of bounds (> 3.0)
+        assert!(Profile::new_with_speed("p", "rainbow", None, 1.0, 3.01, Vec::new())
+            .validate()
+            .is_err());
+        assert!(Profile::new_with_speed("p", "rainbow", None, 1.0, 5.0, Vec::new())
+            .validate()
+            .is_err());
+
+        // NaN
+        assert!(Profile::new_with_speed("p", "rainbow", None, 1.0, f32::NAN, Vec::new())
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn test_profile_assemble_params_with_speed() {
+        let prof = Profile::new_with_speed("fast_rainbow", "rainbow", None, 1.0, 2.0, Vec::new());
+        let params = prof.assemble_params(None).expect("Failed to assemble params");
+        match params {
+            AppliedProfileParams::Effect {
+                effect, brightness, ..
+            } => {
+                assert_eq!(effect, Effect::Rainbow { period_s: 2.5 });
+                assert_eq!(brightness, 1.0);
+            }
+            _ => panic!("Expected Effect params"),
+        }
+    }
 }

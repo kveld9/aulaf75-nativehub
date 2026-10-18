@@ -97,6 +97,17 @@ pub fn query_sysfs_battery_for_device(
 
     // Direct power_supply entry check (if root itself has capacity/status files)
     if power_supply_root.join("capacity").is_file() {
+        if let Some(filter) = device_filter {
+            let f_lower = filter.to_ascii_lowercase();
+            let name = power_supply_root
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            if !name.contains(&f_lower) {
+                return BatteryStatus::empty();
+            }
+        }
         return read_sysfs_battery(power_supply_root);
     }
 
@@ -110,16 +121,16 @@ pub fn query_sysfs_battery_for_device(
         candidates.push(entry.path());
     }
 
-    // Sort to prioritize filtered entries matching target VID/PID or name
+    // When filter is supplied, skip non-matching entries entirely
     if let Some(filter) = device_filter {
         let f_lower = filter.to_ascii_lowercase();
-        candidates.sort_by_key(|p| {
-            let name = p.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
-            if name.contains(&f_lower) {
-                0
-            } else {
-                1
-            }
+        candidates.retain(|p| {
+            let name = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            name.contains(&f_lower)
         });
     }
 

@@ -112,6 +112,8 @@ sudo rm -f /etc/udev/rules.d/99-aula-f75.rules
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
+User profile data stored under `~/.config/aula-f75/` (or `$AULA_F75_CONFIG`) is preserved on uninstall.
+
 ## CLI Usage (`aula-f75-rs`)
 
 The standalone Linux CLI binary (`aula-f75-rs`) operates with zero runtime dependencies beyond `libc`.
@@ -392,4 +394,13 @@ All unit and integration tests are strictly hardware-free and testable without p
 cd rust
 cargo test
 ```
+
+## License
+
+This project is dual-licensed under either:
+
+- [MIT License](LICENSE)
+- [Apache License, Version 2.0](LICENSE)
+
+at your option.
 

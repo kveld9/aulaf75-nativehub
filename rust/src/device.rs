@@ -11,6 +11,12 @@ pub const KNOWN_VID: u16 = 0x258A;
 /// Known Product ID for AULA F75 (0x010C).
 pub const KNOWN_PID: u16 = 0x010C;
 
+/// Default Linux sysfs mount path for hidraw class.
+pub const DEFAULT_SYSFS_HIDRAW: &str = "/sys/class/hidraw";
+
+/// Default Linux sysfs mount path for USB bus devices.
+pub const DEFAULT_SYSFS_USB_DEVICES: &str = "/sys/bus/usb/devices";
+
 #[path = "power.rs"]
 pub mod power;
 
@@ -37,8 +43,8 @@ pub struct DeviceInfo {
 /// Uses default Linux sysfs mount paths: `/sys/class/hidraw` and `/sys/bus/usb/devices`.
 pub fn resolve_control_node() -> Option<PathBuf> {
     resolve_control_node_with_roots(
-        Path::new("/sys/class/hidraw"),
-        Path::new("/sys/bus/usb/devices"),
+        Path::new(DEFAULT_SYSFS_HIDRAW),
+        Path::new(DEFAULT_SYSFS_USB_DEVICES),
         KNOWN_VID,
         KNOWN_PID,
     )
