@@ -149,8 +149,8 @@ fn handle_list_profiles() -> i32 {
                 let default_prof = profile::get_default_profile(None);
                 println!("Saved profiles ({}):", list.len());
                 for name in list {
-                    if default_prof.as_deref() == Some(&name) {
-                        println!("  {} (default)", name);
+                    if profile::is_default(&name, default_prof.as_deref()) {
+                        println!("  {}", profile::format_default_label(&name));
                     } else {
                         println!("  {}", name);
                     }
@@ -190,9 +190,9 @@ fn print_profile_keys(keys: &[(String, (u8, u8, u8))]) {
 fn handle_show_profile(name: &str) -> i32 {
     match profile::load_profile(name, None) {
         Ok(prof) => {
-            let is_default = profile::get_default_profile(None).as_deref() == Some(&prof.name);
-            if is_default {
-                println!("Profile: {} (default)", prof.name);
+            let default_name = profile::get_default_profile(None);
+            if profile::is_default(&prof.name, default_name.as_deref()) {
+                println!("Profile: {}", profile::format_default_label(&prof.name));
             } else {
                 println!("Profile: {}", prof.name);
             }

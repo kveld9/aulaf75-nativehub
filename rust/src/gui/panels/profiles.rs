@@ -202,6 +202,50 @@ impl AulaF75App {
     }
 }
 
+fn profile_item_label(name: &str, default_name: Option<&str>) -> String {
+    if profile::is_default(name, default_name) {
+        profile::format_default_label(name)
+    } else {
+        name.to_string()
+    }
+}
+
+fn selected_profile_label(selected: Option<&String>, default_name: Option<&str>) -> String {
+    match selected {
+        Some(p) => profile_item_label(p, default_name),
+        None => "No profiles saved".to_string(),
+    }
+}
+
+fn render_default_profile_actions(
+    app: &mut AulaF75App,
+    ui: &mut egui::Ui,
+    default_name: Option<&str>,
+) {
+    let is_default = app
+        .selected_profile
+        .as_deref()
+        .map(|name| profile::is_default(name, default_name))
+        .unwrap_or(false);
+
+    if is_default {
+        if ui.button("Clear default").clicked() {
+            app.on_clear_default_clicked();
+        }
+    } else {
+        if app.selected_profile.is_some() {
+            if ui.button("Set as default").clicked() {
+                app.on_set_default_clicked();
+            }
+        }
+        if default_name.is_some() {
+            if ui.button("Clear default").clicked() {
+                app.on_clear_default_clicked();
+            }
+        }
+    }
+}
+
 fn render_profile_selection_row(app: &mut AulaF75App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label(
@@ -210,26 +254,14 @@ fn render_profile_selection_row(app: &mut AulaF75App, ui: &mut egui::Ui) {
                 .color(COLOR_TEXT_SECONDARY),
         );
         let default_name = profile::get_default_profile(None);
-        let current_selection = match &app.selected_profile {
-            Some(p) => {
-                if default_name.as_deref() == Some(p.as_str()) {
-                    format!("{} (default)", p)
-                } else {
-                    p.clone()
-                }
-            }
-            None => "No profiles saved".to_string(),
-        };
+        let current_selection =
+            selected_profile_label(app.selected_profile.as_ref(), default_name.as_deref());
 
         egui::ComboBox::from_label("##profile_combo")
             .selected_text(&current_selection)
             .show_ui(ui, |ui| {
                 for p in &app.saved_profiles {
-                    let label = if default_name.as_deref() == Some(p.as_str()) {
-                        format!("{} (default)", p)
-                    } else {
-                        p.clone()
-                    };
+                    let label = profile_item_label(p, default_name.as_deref());
                     ui.selectable_value(
                         &mut app.selected_profile,
                         Some(p.clone()),
@@ -249,25 +281,7 @@ fn render_profile_selection_row(app: &mut AulaF75App, ui: &mut egui::Ui) {
             app.on_delete_profile_clicked();
         }
 
-        let is_default = app.selected_profile.as_ref() == default_name.as_ref()
-            && app.selected_profile.is_some();
-
-        if is_default {
-            if ui.button("Clear default").clicked() {
-                app.on_clear_default_clicked();
-            }
-        } else {
-            if app.selected_profile.is_some() {
-                if ui.button("Set as default").clicked() {
-                    app.on_set_default_clicked();
-                }
-            }
-            if default_name.is_some() {
-                if ui.button("Clear default").clicked() {
-                    app.on_clear_default_clicked();
-                }
-            }
-        }
+        render_default_profile_actions(app, ui, default_name.as_deref());
     });
 }
 

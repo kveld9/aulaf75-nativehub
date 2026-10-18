@@ -174,7 +174,7 @@ pub enum Commands {
     },
     /// List available host-rendered RGB lighting effects
     Effects,
-    /// Manage local lighting profiles (save, load, list, delete, show)
+    /// Manage local lighting profiles (save, load, list, delete, show, set-default, clear-default)
     Profile {
         #[command(subcommand)]
         action: ProfileCommands,

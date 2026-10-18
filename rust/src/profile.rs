@@ -509,10 +509,13 @@ pub fn list_profiles(base_dir: Option<&Path>) -> Result<Vec<String>, String> {
     Ok(profiles)
 }
 
+/// Default profile marker filename inside the profiles directory.
+pub const DEFAULT_MARKER_FILENAME: &str = "default";
+
 /// Resolve the default profile marker path inside the profiles directory.
 fn default_marker_path(base_dir: Option<&Path>) -> Result<PathBuf, String> {
     let dir = resolve_profiles_dir(base_dir)?;
-    Ok(dir.join("default"))
+    Ok(dir.join(DEFAULT_MARKER_FILENAME))
 }
 
 /// Retrieve the currently configured default profile name, if any.
@@ -552,7 +555,7 @@ pub fn set_default_profile(name: &str, base_dir: Option<&Path>) -> Result<(), St
     fs::create_dir_all(&dir)
         .map_err(|e| format!("Failed to create profiles directory {}: {}", dir.display(), e))?;
 
-    let marker_path = dir.join("default");
+    let marker_path = dir.join(DEFAULT_MARKER_FILENAME);
     fs::write(&marker_path, format!("{}\n", trimmed)).map_err(|e| {
         format!(
             "Failed to write default profile marker {}: {}",
@@ -593,9 +596,7 @@ pub fn delete_profile(name: &str, base_dir: Option<&Path>) -> Result<(), String>
             file_path.display()
         ));
     }
-    let was_default = fs::read_to_string(dir.join("default"))
-        .map(|c| c.trim() == trimmed)
-        .unwrap_or(false);
+    let was_default = get_default_profile(base_dir).as_deref() == Some(trimmed);
 
     fs::remove_file(&file_path)
         .map_err(|e| format!("Failed to delete profile {}: {}", file_path.display(), e))?;
@@ -604,6 +605,16 @@ pub fn delete_profile(name: &str, base_dir: Option<&Path>) -> Result<(), String>
         let _ = clear_default_profile(base_dir);
     }
     Ok(())
+}
+
+/// Format a display label indicating that a profile is the default startup profile.
+pub fn format_default_label(name: &str) -> String {
+    format!("{} (default)", name)
+}
+
+/// Check if a profile name matches the currently configured default profile.
+pub fn is_default(name: &str, default_name: Option<&str>) -> bool {
+    default_name == Some(name)
 }
 
 #[cfg(test)]
@@ -682,5 +693,14 @@ mod tests {
             }
             _ => panic!("Expected Effect params"),
         }
+    }
+
+    #[test]
+    fn test_format_default_label() {
+        assert_eq!(format_default_label("solid_blue"), "solid_blue (default)");
+        assert_eq!(format_default_label(""), " (default)");
+        assert!(is_default("solid_blue", Some("solid_blue")));
+        assert!(!is_default("solid_blue", Some("other")));
+        assert!(!is_default("solid_blue", None));
     }
 }
