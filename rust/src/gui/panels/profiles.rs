@@ -31,6 +31,7 @@ impl AulaF75App {
     }
 
     fn send_or_start_worker(&mut self, msg: WorkerMessage) {
+        self.note_worker_message(&msg);
         if self.is_worker_running() {
             if let Some(ref tx) = self.worker_tx {
                 let _ = tx.send(msg);
@@ -52,7 +53,7 @@ impl AulaF75App {
     }
 
     fn apply_key_profile(&mut self, prof: &Profile) {
-        let msg = WorkerMessage::SetKeyFrame(prof.keys.clone());
+        let msg = self.state.transition_to_keyframe(prof.keys.clone());
         self.send_or_start_worker(msg);
         let msg_text = format!("Profile '{}' applied ({} keys)", prof.name, prof.keys.len());
         self.set_profile_status_msg(msg_text);

@@ -79,11 +79,12 @@ Integrated management interface for persistent presets:
 ### Status Footer Bar
 Persistent bottom bar reporting active stream name, estimated tick rate, and hardware communication status.
 
-### Systemd Service Coordination (Single-Writer Rule)
-- **Automatic Service Parking**: To prevent flicker between two concurrent writers and enforce the single-writer rule on the `/dev/hidraw*` control node, `aula-f75-gui` automatically parks the background systemd user service (`aula-f75.service`) while open.
-- **Automatic Restoration**: When the GUI is closed, the application restores `aula-f75.service` on exit if it was active prior to launch.
-- **Single-Writer Rule**: Only one writer should control the keyboard's direct RGB interface at any given time. While the GUI runs, it owns the device control node exclusively.
-- **Persistent Lighting After Exit**: Direct RGB streaming stops when the GUI window is closed. To maintain a static color or lighting preset after closing the GUI, set the service unit's `ExecStart` directive to that desired `solid` color or `profile load` preset.
+### Systemd Service Coordination (Adopt-on-Exit & Single-Writer Rule)
+- **Automatic Service Parking**: To prevent flicker between two concurrent writers and enforce the single-writer rule on the `/dev/hidraw*` control node, `aula-f75-gui` automatically parks the background systemd user service (`aula-f75.service`) upon startup.
+- **Adopt-on-Exit for Streamed Sessions**: When the GUI closes after streaming lighting (Solid, Effect, Music, or per-key overrides), it automatically adopts the last active GUI lighting configuration into `aula-f75.service`. It rewrites the `ExecStart` line in the installed user unit file (`%h/.config/systemd/user/aula-f75.service`), reloads the systemd daemon (`daemon-reload`), enables the unit, and restarts it so that the desired lighting remains active immediately—even if the service was previously inactive.
+- **Idle Session Restoration**: If the GUI was opened and closed without streaming any lighting changes, adopt is skipped and previous service state is preserved: `aula-f75.service` is restarted only if it was active prior to launching the GUI.
+- **Per-Key Frame Limitation**: Standalone CLI execution does not include a dedicated hold daemon for custom per-key lighting maps (`SetKeyFrame`). When adopting after applying per-key overrides, the service falls back to a solid color hold using the current GUI base RGB color.
+- **Single-Writer Rule**: Only one writer controls the keyboard's direct RGB interface at any given time. While the GUI runs, it owns the device control node exclusively; upon exit, the background service seamlessly takes over.
 
 ---
 

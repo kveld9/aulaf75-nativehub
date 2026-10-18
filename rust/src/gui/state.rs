@@ -14,7 +14,8 @@ use crate::effects::Effect;
 use crate::gui::panels;
 use crate::gui::reconnect::{run_worker_reconnect_loop, run_worker_thread};
 use crate::gui::service::{
-    restore_after_gui, suspend_for_gui, FakeServiceRunner, ServiceRunner, SystemdServiceRunner,
+    adopt_service_command, resolve_service_unit_path, restore_after_gui, service_args_for_state,
+    suspend_for_gui, FakeServiceRunner, ServiceRunner, SystemdServiceRunner,
 };
 use crate::gui::theme::{
     app_visuals, configure_app_style, corner_radius, COLOR_BG_INPUT, COLOR_BORDER_SUBTLE,
@@ -44,6 +45,8 @@ pub enum GuiLightingMode {
 pub struct GuiState {
     pub mode: GuiLightingMode,
     pub rgb: (u8, u8, u8),
+    pub streamed: bool,
+    pub last_was_keyframe: bool,
 }
 
 impl Default for GuiState {
@@ -51,6 +54,8 @@ impl Default for GuiState {
         Self {
             mode: GuiLightingMode::Off,
             rgb: (255, 0, 0),
+            streamed: false,
+            last_was_keyframe: false,
         }
     }
 }
@@ -64,12 +69,16 @@ impl GuiState {
     pub fn transition_to_solid(&mut self, rgb: (u8, u8, u8)) -> WorkerMessage {
         self.mode = GuiLightingMode::Solid;
         self.rgb = rgb;
+        self.streamed = true;
+        self.last_was_keyframe = false;
         WorkerMessage::SetColor(rgb)
     }
 
     /// Transition to Effect mode with the given effect and brightness.
     pub fn transition_to_effect(&mut self, effect: Effect, brightness: f32) -> WorkerMessage {
         self.mode = GuiLightingMode::Effect(effect.clone());
+        self.streamed = true;
+        self.last_was_keyframe = false;
         WorkerMessage::SetEffect { effect, brightness }
     }
 
@@ -82,13 +91,24 @@ impl GuiState {
     ) -> WorkerMessage {
         self.mode = GuiLightingMode::Music { mode, gain };
         self.rgb = color;
+        self.streamed = true;
+        self.last_was_keyframe = false;
         WorkerMessage::SetMusic { mode, color, gain }
     }
 
     /// Transition to Off mode.
     pub fn transition_to_off(&mut self) -> WorkerMessage {
         self.mode = GuiLightingMode::Off;
+        self.streamed = true;
+        self.last_was_keyframe = false;
         WorkerMessage::Off
+    }
+
+    /// Transition to keyframe mode.
+    pub fn transition_to_keyframe(&mut self, keys: Vec<(String, (u8, u8, u8))>) -> WorkerMessage {
+        self.streamed = true;
+        self.last_was_keyframe = true;
+        WorkerMessage::SetKeyFrame(keys)
     }
 
     /// Transition to stopped state.
@@ -149,6 +169,12 @@ pub struct AulaF75App {
     pub service_runner: Option<Box<dyn ServiceRunner>>,
     /// Whether the background service was active before GUI takeover.
     pub service_was_active: bool,
+    /// Whether lighting was streamed at least once during this GUI session.
+    pub streamed: bool,
+    /// Whether the last dispatched lighting frame was a per-key frame (SetKeyFrame).
+    pub last_was_keyframe: bool,
+    /// Custom path to the systemd unit file (for hardware-free tests).
+    pub custom_service_unit_path: Option<PathBuf>,
 }
 
 impl Default for AulaF75App {
@@ -163,6 +189,8 @@ impl Default for AulaF75App {
             state: GuiState {
                 mode: GuiLightingMode::Off,
                 rgb: (initial_rgb[0], initial_rgb[1], initial_rgb[2]),
+                streamed: false,
+                last_was_keyframe: false,
             },
             color_rgb: initial_rgb,
             hex_input: initial_hex,
@@ -185,6 +213,9 @@ impl Default for AulaF75App {
             worker_handle: None,
             service_runner: None,
             service_was_active: false,
+            streamed: false,
+            last_was_keyframe: false,
+            custom_service_unit_path: None,
         }
     }
 }
@@ -240,15 +271,58 @@ impl AulaF75App {
         app
     }
 
-    /// Restore the background service if it was suspended when the GUI opened.
+    /// Restore the background service, adopting the last GUI state if lighting was streamed.
     ///
-    /// Ensures restore is executed at most once.
+    /// If the GUI streamed at least once, adopts the last active lighting state into
+    /// `aula-f75.service` (rewriting ExecStart and reloading/enabling/restarting),
+    /// regardless of whether the service was initially active.
+    /// If the GUI was idle (never streamed), restores the service only if it was active
+    /// prior to GUI launch.
+    ///
+    /// Ensures restore/adopt is executed at most once.
     pub fn restore_service(&mut self) {
-        if self.service_was_active {
+        let did_stream = self.streamed || self.state.streamed;
+        if did_stream {
+            self.adopt_service();
+            self.streamed = false;
+            self.state.streamed = false;
+            self.service_was_active = false;
+        } else if self.service_was_active {
             if let Some(ref mut runner) = self.service_runner {
                 restore_after_gui(runner.as_mut(), true);
             }
             self.service_was_active = false;
+        }
+    }
+
+    fn adopt_service(&mut self) {
+        let is_keyframe = self.last_was_keyframe || self.state.last_was_keyframe;
+        let mode = if is_keyframe {
+            GuiLightingMode::Solid
+        } else {
+            self.state.mode.clone()
+        };
+        let rgb = (self.color_rgb[0], self.color_rgb[1], self.color_rgb[2]);
+        let args = service_args_for_state(&mode, rgb, self.brightness, self.effect_speed);
+
+        let runner = match self.service_runner.as_mut() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let unit_path = self
+            .custom_service_unit_path
+            .clone()
+            .or_else(|| resolve_service_unit_path(None));
+
+        if let Some(path) = unit_path {
+            adopt_service_command(&path, &args, runner.as_mut());
+        } else {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runner.daemon_reload();
+                runner.enable();
+                runner.restart();
+            }));
         }
     }
 
@@ -346,9 +420,31 @@ impl AulaF75App {
         self.status_text = format!("Error: {}", err);
     }
 
+    /// Track worker message for adopt-on-exit state and keyframe detection.
+    pub fn note_worker_message(&mut self, msg: &WorkerMessage) {
+        match msg {
+            WorkerMessage::SetKeyFrame(_) => {
+                self.streamed = true;
+                self.last_was_keyframe = true;
+                self.state.streamed = true;
+                self.state.last_was_keyframe = true;
+            }
+            WorkerMessage::Stop => {}
+            _ => {
+                self.streamed = true;
+                self.last_was_keyframe = false;
+                self.state.streamed = true;
+                self.state.last_was_keyframe = false;
+            }
+        }
+    }
+
     /// Spawn worker thread with initial command or in idle mode if None.
     pub fn start_worker<I: Into<Option<WorkerMessage>>>(&mut self, initial_cmd: I) {
         let cmd = initial_cmd.into();
+        if let Some(ref msg) = cmd {
+            self.note_worker_message(msg);
+        }
         if self.is_worker_running() {
             if let Some(ref tx) = self.worker_tx {
                 if let Some(msg) = cmd {
@@ -390,6 +486,9 @@ impl AulaF75App {
         I: Into<Option<WorkerMessage>>,
     {
         let cmd = initial_cmd.into();
+        if let Some(ref msg) = cmd {
+            self.note_worker_message(msg);
+        }
         if self.is_worker_running() {
             if let Some(ref tx) = self.worker_tx {
                 if let Some(msg) = cmd {
@@ -503,8 +602,8 @@ impl AulaF75App {
 
 impl Drop for AulaF75App {
     fn drop(&mut self) {
-        self.stop_worker();
         self.restore_service();
+        self.stop_worker();
     }
 }
 
@@ -638,5 +737,116 @@ mod tests {
             |_| {},
         );
         assert!(!app.service_was_active);
+    }
+
+    #[test]
+    fn test_app_adopt_on_exit_when_streamed() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aula_state_adopt_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let unit_path = temp_dir.join("aula-f75.service");
+
+        let initial_content = "[Unit]\nDescription=AULA F75\n\n[Service]\nType=simple\nExecStart=%h/.local/bin/aula-f75-rs solid 303030\n\n[Install]\nWantedBy=default.target\n";
+        std::fs::write(&unit_path, initial_content).unwrap();
+
+        let fake = FakeServiceRunner::new(false);
+        let mut app = AulaF75App::new_with_service_runner(fake.clone());
+        app.custom_service_unit_path = Some(unit_path.clone());
+        app.brightness = 0.8;
+        app.effect_speed = 1.5;
+        app.state
+            .transition_to_effect(Effect::Rainbow { period_s: 5.0 }, 0.8);
+        app.streamed = true;
+
+        drop(app);
+
+        assert_eq!(fake.daemon_reload_count(), 1);
+        assert_eq!(fake.enable_count(), 1);
+        assert_eq!(fake.restart_count(), 1);
+        assert!(fake.is_active());
+
+        let content = std::fs::read_to_string(&unit_path).unwrap();
+        assert!(content.contains("ExecStart=%h/.local/bin/aula-f75-rs fx rainbow --brightness 0.8 --speed 1.5"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_app_adopt_keyframe_falls_back_to_solid() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aula_state_keyframe_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let unit_path = temp_dir.join("aula-f75.service");
+
+        let initial_content = "[Unit]\nDescription=AULA F75\n\n[Service]\nType=simple\nExecStart=%h/.local/bin/aula-f75-rs solid 303030\n\n[Install]\nWantedBy=default.target\n";
+        std::fs::write(&unit_path, initial_content).unwrap();
+
+        let fake = FakeServiceRunner::new(false);
+        let mut app = AulaF75App::new_with_service_runner(fake.clone());
+        app.custom_service_unit_path = Some(unit_path.clone());
+        app.color_rgb = [0, 128, 255];
+        app.state.rgb = (0, 128, 255);
+        app.note_worker_message(&WorkerMessage::SetKeyFrame(vec![(
+            "esc".to_string(),
+            (255, 0, 0),
+        )]));
+
+        assert!(app.streamed);
+        assert!(app.last_was_keyframe);
+
+        drop(app);
+
+        assert_eq!(fake.restart_count(), 1);
+
+        let content = std::fs::read_to_string(&unit_path).unwrap();
+        assert!(content.contains("ExecStart=%h/.local/bin/aula-f75-rs solid 0080FF"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_app_adopt_executed_only_once() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aula_state_once_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let unit_path = temp_dir.join("aula-f75.service");
+
+        let initial_content = "[Unit]\nDescription=AULA F75\n\n[Service]\nType=simple\nExecStart=%h/.local/bin/aula-f75-rs solid 303030\n";
+        std::fs::write(&unit_path, initial_content).unwrap();
+
+        let fake = FakeServiceRunner::new(false);
+        let mut app = AulaF75App::new_with_service_runner(fake.clone());
+        app.custom_service_unit_path = Some(unit_path.clone());
+        app.state.transition_to_solid((255, 0, 0));
+        app.streamed = true;
+
+        app.restore_service();
+        assert_eq!(fake.restart_count(), 1);
+
+        app.restore_service();
+        assert_eq!(fake.restart_count(), 1);
+
+        drop(app);
+        assert_eq!(fake.restart_count(), 1);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
