@@ -154,37 +154,37 @@ pub fn app_visuals() -> egui::Visuals {
 
     // Non-interactive widgets
     visuals.widgets.noninteractive.bg_fill = COLOR_BG_CARD;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, COLOR_BORDER_SUBTLE);
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, COLOR_TEXT_SECONDARY);
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, COLOR_BORDER_SUBTLE);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, COLOR_TEXT_SECONDARY);
     visuals.widgets.noninteractive.corner_radius = card_radius;
 
     // Inactive interactive widgets
     visuals.widgets.inactive.bg_fill = COLOR_BG_CARD;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, COLOR_BORDER_SUBTLE);
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, COLOR_TEXT_PRIMARY);
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, COLOR_BORDER_SUBTLE);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, COLOR_TEXT_PRIMARY);
     visuals.widgets.inactive.corner_radius = card_radius;
 
     // Hovered widgets
     visuals.widgets.hovered.bg_fill = COLOR_BG_CARD_HOVER;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, COLOR_ACCENT);
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, COLOR_ACCENT);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     visuals.widgets.hovered.corner_radius = card_radius;
 
     // Active (pressed) widgets
     visuals.widgets.active.bg_fill = COLOR_ACCENT_BG;
-    visuals.widgets.active.bg_stroke = Stroke::new(1.5, COLOR_ACCENT_HOVER);
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.5_f32, COLOR_ACCENT_HOVER);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     visuals.widgets.active.corner_radius = card_radius;
 
     // Open menus / dropdowns
     visuals.widgets.open.bg_fill = COLOR_BG_CARD;
-    visuals.widgets.open.bg_stroke = Stroke::new(1.0, COLOR_BORDER_SUBTLE);
-    visuals.widgets.open.fg_stroke = Stroke::new(1.0, COLOR_TEXT_PRIMARY);
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, COLOR_BORDER_SUBTLE);
+    visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, COLOR_TEXT_PRIMARY);
     visuals.widgets.open.corner_radius = card_radius;
 
     // Selection highlight
     visuals.selection.bg_fill = COLOR_ACCENT_BG;
-    visuals.selection.stroke = Stroke::new(1.0, COLOR_ACCENT);
+    visuals.selection.stroke = Stroke::new(1.0_f32, COLOR_ACCENT);
 
     visuals
 }
@@ -201,7 +201,7 @@ pub fn card_frame() -> egui::Frame {
     egui::Frame::default()
         .fill(COLOR_BG_CARD)
         .corner_radius(corner_radius(6))
-        .stroke(Stroke::new(1.0, COLOR_BORDER_SUBTLE))
+        .stroke(Stroke::new(1.0_f32, COLOR_BORDER_SUBTLE))
         .inner_margin(Margin::same(12))
 }
 
@@ -214,7 +214,7 @@ pub fn render_status_badge(ui: &mut egui::Ui, state: ConnectionBadgeState) {
     egui::Frame::default()
         .fill(bg_color)
         .corner_radius(corner_radius(4))
-        .stroke(Stroke::new(1.0, COLOR_BORDER_SUBTLE))
+        .stroke(Stroke::new(1.0_f32, COLOR_BORDER_SUBTLE))
         .inner_margin(Margin {
             left: 8,
             right: 8,
@@ -1826,7 +1826,7 @@ impl eframe::App for AulaF75App {
                         egui::Frame::default()
                             .fill(Color32::from_rgb(44, 18, 22))
                             .corner_radius(corner_radius(4))
-                            .stroke(Stroke::new(1.0, COLOR_STATUS_ERROR))
+                            .stroke(Stroke::new(1.0_f32, COLOR_STATUS_ERROR))
                             .inner_margin(Margin::same(6))
                             .show(ui, |ui| {
                                 ui.vertical(|ui| {
@@ -1854,7 +1854,7 @@ impl eframe::App for AulaF75App {
                         egui::Frame::default()
                             .fill(COLOR_BG_INPUT)
                             .corner_radius(corner_radius(4))
-                            .stroke(Stroke::new(1.0, COLOR_BORDER_SUBTLE))
+                            .stroke(Stroke::new(1.0_f32, COLOR_BORDER_SUBTLE))
                             .inner_margin(Margin::same(6))
                             .show(ui, |ui| {
                                 ui.vertical(|ui| {
@@ -2003,13 +2003,13 @@ impl eframe::App for AulaF75App {
                         let (bg, stroke, text_color) = if is_selected {
                             (
                                 COLOR_ACCENT_BG,
-                                Stroke::new(1.5, COLOR_ACCENT),
+                                Stroke::new(1.5_f32, COLOR_ACCENT),
                                 COLOR_TEXT_PRIMARY,
                             )
                         } else {
                             (
                                 COLOR_BG_CARD,
-                                Stroke::new(1.0, COLOR_BORDER_SUBTLE),
+                                Stroke::new(1.0_f32, COLOR_BORDER_SUBTLE),
                                 COLOR_TEXT_SECONDARY,
                             )
                         };
@@ -2124,7 +2124,7 @@ impl eframe::App for AulaF75App {
                         egui::Frame::default()
                             .fill(COLOR_BG_INPUT)
                             .corner_radius(corner_radius(6))
-                            .stroke(Stroke::new(1.0, COLOR_BORDER_SUBTLE))
+                            .stroke(Stroke::new(1.0_f32, COLOR_BORDER_SUBTLE))
                             .inner_margin(Margin::same(8))
                             .show(ui, |ui| {
                                 ui.vertical(|ui| {
@@ -2137,7 +2137,7 @@ impl eframe::App for AulaF75App {
                                     egui::Frame::default()
                                         .fill(preview_color)
                                         .corner_radius(corner_radius(4))
-                                        .stroke(Stroke::new(1.0, COLOR_BORDER_SUBTLE))
+                                        .stroke(Stroke::new(1.0_f32, COLOR_BORDER_SUBTLE))
                                         .show(ui, |ui| {
                                             ui.allocate_exact_size(
                                                 Vec2::new(72.0, 40.0),
@@ -2194,7 +2194,7 @@ impl eframe::App for AulaF75App {
                             .color(Color32::WHITE),
                     )
                     .fill(Color32::from_rgb(0, 140, 175))
-                    .stroke(Stroke::new(1.0, COLOR_ACCENT))
+                    .stroke(Stroke::new(1.0_f32, COLOR_ACCENT))
                     .min_size(Vec2::new(120.0, 32.0));
 
                     if ui.add(start_btn).clicked() {
@@ -2207,7 +2207,7 @@ impl eframe::App for AulaF75App {
                             .color(COLOR_TEXT_PRIMARY),
                     )
                     .fill(COLOR_BG_CARD)
-                    .stroke(Stroke::new(1.0, COLOR_BORDER_SUBTLE))
+                    .stroke(Stroke::new(1.0_f32, COLOR_BORDER_SUBTLE))
                     .min_size(Vec2::new(100.0, 32.0));
 
                     if ui.add(stop_btn).clicked() {
@@ -2384,7 +2384,7 @@ impl eframe::App for AulaF75App {
                                 .color(COLOR_TEXT_PRIMARY),
                         )
                         .fill(COLOR_BG_CARD)
-                        .stroke(Stroke::new(1.0, COLOR_BORDER_SUBTLE))
+                        .stroke(Stroke::new(1.0_f32, COLOR_BORDER_SUBTLE))
                         .min_size(Vec2::new(100.0, 28.0));
 
                         if ui.add(stop_music_btn).clicked() {
@@ -2398,7 +2398,7 @@ impl eframe::App for AulaF75App {
                                 .color(Color32::WHITE),
                         )
                         .fill(Color32::from_rgb(0, 140, 175))
-                        .stroke(Stroke::new(1.0, COLOR_ACCENT))
+                        .stroke(Stroke::new(1.0_f32, COLOR_ACCENT))
                         .min_size(Vec2::new(100.0, 28.0));
 
                         if ui.add(start_music_btn).clicked() {
@@ -2461,7 +2461,7 @@ impl eframe::App for AulaF75App {
             egui::Frame::default()
                 .fill(COLOR_BG_INPUT)
                 .corner_radius(corner_radius(4))
-                .stroke(Stroke::new(1.0, COLOR_BORDER_SUBTLE))
+                .stroke(Stroke::new(1.0_f32, COLOR_BORDER_SUBTLE))
                 .inner_margin(Margin {
                     left: 10,
                     right: 10,
