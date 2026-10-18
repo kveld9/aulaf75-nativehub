@@ -514,3 +514,69 @@ fn test_start_when_worker_alive_does_not_duplicate() {
     assert!(!app.is_worker_running());
 }
 
+#[test]
+fn test_app_visuals_returns_cohesive_dark_theme() {
+    let visuals = aula_f75::gui::app_visuals();
+    assert!(visuals.dark_mode);
+    assert_eq!(visuals.panel_fill, aula_f75::gui::COLOR_BG_PANEL);
+    assert_eq!(visuals.window_fill, aula_f75::gui::COLOR_BG_CENTRAL);
+    assert_eq!(
+        visuals.widgets.inactive.corner_radius,
+        aula_f75::gui::corner_radius(6)
+    );
+}
+
+#[test]
+fn test_compute_preview_rgb() {
+    assert_eq!(
+        aula_f75::gui::compute_preview_rgb([255, 100, 50], 1.0),
+        (255, 100, 50)
+    );
+    assert_eq!(
+        aula_f75::gui::compute_preview_rgb([200, 100, 50], 0.5),
+        (100, 50, 25)
+    );
+    assert_eq!(
+        aula_f75::gui::compute_preview_rgb([255, 255, 255], 0.0),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        aula_f75::gui::compute_preview_rgb([100, 100, 100], 1.5),
+        (100, 100, 100)
+    );
+    assert_eq!(
+        aula_f75::gui::compute_preview_rgb([100, 100, 100], -0.5),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn test_connection_badge_state_transitions() {
+    use aula_f75::gui::ConnectionBadgeState;
+
+    // Error state takes precedence
+    let state = ConnectionBadgeState::determine(true, true, "Running", true);
+    assert_eq!(state, ConnectionBadgeState::Error);
+    assert_eq!(state.label(), "Error");
+
+    // Streaming active
+    let state = ConnectionBadgeState::determine(true, true, "Streaming active", false);
+    assert_eq!(state, ConnectionBadgeState::Streaming);
+    assert_eq!(state.label(), "Streaming Active");
+
+    // Connected idle
+    let state = ConnectionBadgeState::determine(true, false, "Connected (idle)", false);
+    assert_eq!(state, ConnectionBadgeState::ConnectedIdle);
+    assert_eq!(state.label(), "Connected (idle)");
+
+    // Disconnected
+    let state = ConnectionBadgeState::determine(false, false, "Disconnected", false);
+    assert_eq!(state, ConnectionBadgeState::Disconnected);
+    assert_eq!(state.label(), "Disconnected");
+
+    // Connecting / Searching
+    let state = ConnectionBadgeState::determine(false, false, "Connecting...", false);
+    assert_eq!(state, ConnectionBadgeState::Connecting);
+    assert_eq!(state.label(), "Connecting...");
+}
+

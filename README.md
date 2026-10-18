@@ -275,12 +275,14 @@ cargo run --bin aula-f75-gui
 
 ### Features
 
-- **Side Panel Hardware Status**: Left side panel displays live device connection status (indicator dot, device model, VID/PID `258a:010c`, interface 1 node path, and error diagnostics).
-- **Effect Selection**: Dropdown selector supporting `Solid`, `Rainbow`, `Wave`, `Breathe`, `Stars`, and `Off`.
-- **Dynamic Parameters**: Color picker and hex input field enabled for color-dependent modes (`Solid`, `Breathe`); global brightness slider (`0%..=100%`) applied smoothly across all effects.
-- **Lighting Profiles Panel**: Integrated profiles management interface with profile dropdown selector, instant **Apply** button, **Delete** button, and **Save Profile** input capturing the active effect, color, and brightness into a local flat file preset without cloud or vendor dependencies.
+- **Cohesive Modern Dark Theme**: Bespoke Nordic dark palette with single cyan accent (`#00b4d8`), 4px-based spacing multiples, 6px consistent corner radiuses, and readable typographic hierarchy.
+- **Side Panel Hardware Status & Reference**: Left side panel displays multi-state connection badge (`Streaming Active`, `Connected (idle)`, `Connecting...`, `Disconnected`, `Error`), compact device facts grid (`AULA F75`, `258a:010c`, interface 1 node path), diagnostic cause/action microcopy, and a collapsible **Keyboard Reference** documenting onboard Fn shortcuts (Custom RGB profile requirement, Fn+Backspace toggle, Knob long-press modes, Fn+B battery indicator).
+- **Segmented Effect Strip**: Sleek horizontal selectable card strip for instant switching between `Solid`, `Rainbow`, `Wave`, `Breathe`, `Stars`, and `Off`.
+- **Live Color Preview Swatch**: Color swatch panel showing the current scaled RGB and brightness output alongside interactive color picker, RGB sliders, and hex input.
+- **Lighting Profiles Panel**: Integrated profiles management interface with profile dropdown selector, instant **Apply** button, **Delete** button, and **Save Profile** input capturing active parameters into local flat file presets without cloud or vendor dependencies.
+- **Audio Reactive Lighting (Music Mode)**: Frequency-reactive lighting with mode selector (`Bars`, `Pulse`), base color picker, audio gain slider, real-time energy level meter, and dedicated controls.
 - **Non-Blocking Streaming Worker**: Direct Report 6 frames are streamed at ~25 Hz (`Duration::from_millis(40)`) for fluid animations and ~1.5 Hz (`KEEPALIVE_HZ`) for solid keepalive on a dedicated background thread with transient error retry (`EPIPE`, `ETIMEDOUT`). The UI rendering thread is never blocked.
-- **Start / Stop Controls**: Dedicated "Start Streaming" and "Stop / Off" buttons with live footer reporting active stream name, estimated tick rate, and hardware communication status.
+- **Professional Controls & Live Footer**: Clean labeled buttons (no emoji icons) and persistent status bar reporting active stream name, estimated tick rate, and hardware communication status.
 - **Clean Lifecycle**: Window close signals worker termination and cleanly drops the device descriptor without blocking the UI thread.
 
 ### Troubleshooting

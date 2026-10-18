@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use eframe::egui;
+use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
 
 pub use crate::cli::parse_color_hex;
 use crate::cli::music::{self, MusicMode};
@@ -21,6 +21,220 @@ use crate::cli::profile::{self, Profile};
 use crate::device;
 use crate::effects::{self, Effect, RGB};
 use crate::proto;
+
+// --- Theme Tokens & Layout Metrics ---
+
+/// Neutral background colors.
+pub const COLOR_BG_PANEL: Color32 = Color32::from_rgb(18, 20, 26);
+pub const COLOR_BG_CENTRAL: Color32 = Color32::from_rgb(23, 25, 33);
+pub const COLOR_BG_CARD: Color32 = Color32::from_rgb(29, 32, 42);
+pub const COLOR_BG_CARD_HOVER: Color32 = Color32::from_rgb(37, 41, 54);
+pub const COLOR_BG_INPUT: Color32 = Color32::from_rgb(15, 17, 22);
+
+/// Border and separator strokes.
+pub const COLOR_BORDER_SUBTLE: Color32 = Color32::from_rgb(42, 46, 60);
+pub const COLOR_BORDER_ACCENT: Color32 = Color32::from_rgb(0, 180, 216);
+
+/// Typography contrast hierarchy.
+pub const COLOR_TEXT_PRIMARY: Color32 = Color32::from_rgb(240, 243, 250);
+pub const COLOR_TEXT_SECONDARY: Color32 = Color32::from_rgb(160, 166, 184);
+pub const COLOR_TEXT_MUTED: Color32 = Color32::from_rgb(110, 116, 134);
+
+/// Single cohesive accent: Nordic Teal.
+pub const COLOR_ACCENT: Color32 = Color32::from_rgb(0, 180, 216);
+pub const COLOR_ACCENT_HOVER: Color32 = Color32::from_rgb(20, 200, 235);
+pub const COLOR_ACCENT_BG: Color32 = Color32::from_rgb(12, 44, 54);
+
+/// Connection and status indicator colors.
+pub const COLOR_STATUS_STREAMING: Color32 = Color32::from_rgb(34, 197, 94);
+pub const COLOR_STATUS_IDLE: Color32 = Color32::from_rgb(56, 189, 248);
+pub const COLOR_STATUS_CONNECTING: Color32 = Color32::from_rgb(250, 204, 21);
+pub const COLOR_STATUS_DISCONNECTED: Color32 = Color32::from_rgb(148, 163, 184);
+pub const COLOR_STATUS_ERROR: Color32 = Color32::from_rgb(248, 113, 113);
+
+/// Helper to construct a uniform CornerRadius.
+pub const fn corner_radius(radius: u8) -> CornerRadius {
+    CornerRadius {
+        nw: radius,
+        ne: radius,
+        sw: radius,
+        se: radius,
+    }
+}
+
+/// Compute live rendered RGB output tuple after applying brightness scaling.
+pub fn compute_preview_rgb(rgb: [u8; 3], brightness: f32) -> (u8, u8, u8) {
+    let factor = brightness.clamp(0.0, 1.0);
+    (
+        ((rgb[0] as f32) * factor).round() as u8,
+        ((rgb[1] as f32) * factor).round() as u8,
+        ((rgb[2] as f32) * factor).round() as u8,
+    )
+}
+
+/// Connection state category for the side panel hardware status badge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionBadgeState {
+    Streaming,
+    ConnectedIdle,
+    Connecting,
+    Disconnected,
+    Error,
+}
+
+impl ConnectionBadgeState {
+    /// Determine badge state from app fields.
+    pub fn determine(
+        has_node: bool,
+        is_streaming: bool,
+        status_text: &str,
+        has_error: bool,
+    ) -> Self {
+        if has_error {
+            Self::Error
+        } else if has_node {
+            if is_streaming {
+                Self::Streaming
+            } else {
+                Self::ConnectedIdle
+            }
+        } else if status_text == "Disconnected" {
+            Self::Disconnected
+        } else {
+            Self::Connecting
+        }
+    }
+
+    /// Label text displayed on the badge.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Streaming => "Streaming Active",
+            Self::ConnectedIdle => "Connected (idle)",
+            Self::Connecting => "Connecting...",
+            Self::Disconnected => "Disconnected",
+            Self::Error => "Error",
+        }
+    }
+
+    /// Primary dot indicator color.
+    pub fn dot_color(self) -> Color32 {
+        match self {
+            Self::Streaming => COLOR_STATUS_STREAMING,
+            Self::ConnectedIdle => COLOR_STATUS_IDLE,
+            Self::Connecting => COLOR_STATUS_CONNECTING,
+            Self::Disconnected => COLOR_STATUS_DISCONNECTED,
+            Self::Error => COLOR_STATUS_ERROR,
+        }
+    }
+
+    /// Background pill fill color.
+    pub fn bg_color(self) -> Color32 {
+        match self {
+            Self::Streaming => Color32::from_rgb(18, 48, 30),
+            Self::ConnectedIdle => Color32::from_rgb(16, 42, 54),
+            Self::Connecting => Color32::from_rgb(48, 40, 16),
+            Self::Disconnected => Color32::from_rgb(32, 36, 44),
+            Self::Error => Color32::from_rgb(52, 20, 24),
+        }
+    }
+}
+
+/// Create a cohesive, modern dark theme visuals configuration for the AULA F75 GUI.
+pub fn app_visuals() -> egui::Visuals {
+    let mut visuals = egui::Visuals::dark();
+    visuals.dark_mode = true;
+    visuals.panel_fill = COLOR_BG_PANEL;
+    visuals.window_fill = COLOR_BG_CENTRAL;
+    visuals.faint_bg_color = COLOR_BG_CARD;
+    visuals.extreme_bg_color = COLOR_BG_INPUT;
+    visuals.code_bg_color = COLOR_BG_INPUT;
+
+    let card_radius = corner_radius(6);
+    visuals.window_corner_radius = card_radius;
+
+    // Non-interactive widgets
+    visuals.widgets.noninteractive.bg_fill = COLOR_BG_CARD;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, COLOR_BORDER_SUBTLE);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, COLOR_TEXT_SECONDARY);
+    visuals.widgets.noninteractive.corner_radius = card_radius;
+
+    // Inactive interactive widgets
+    visuals.widgets.inactive.bg_fill = COLOR_BG_CARD;
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, COLOR_BORDER_SUBTLE);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, COLOR_TEXT_PRIMARY);
+    visuals.widgets.inactive.corner_radius = card_radius;
+
+    // Hovered widgets
+    visuals.widgets.hovered.bg_fill = COLOR_BG_CARD_HOVER;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, COLOR_ACCENT);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.widgets.hovered.corner_radius = card_radius;
+
+    // Active (pressed) widgets
+    visuals.widgets.active.bg_fill = COLOR_ACCENT_BG;
+    visuals.widgets.active.bg_stroke = Stroke::new(1.5, COLOR_ACCENT_HOVER);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.widgets.active.corner_radius = card_radius;
+
+    // Open menus / dropdowns
+    visuals.widgets.open.bg_fill = COLOR_BG_CARD;
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0, COLOR_BORDER_SUBTLE);
+    visuals.widgets.open.fg_stroke = Stroke::new(1.0, COLOR_TEXT_PRIMARY);
+    visuals.widgets.open.corner_radius = card_radius;
+
+    // Selection highlight
+    visuals.selection.bg_fill = COLOR_ACCENT_BG;
+    visuals.selection.stroke = Stroke::new(1.0, COLOR_ACCENT);
+
+    visuals
+}
+
+/// Configure 4px-based spacing and sizing hierarchy for the application style.
+pub fn configure_app_style(style: &mut egui::Style) {
+    style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+    style.spacing.button_padding = Vec2::new(12.0, 6.0);
+    style.spacing.indent = 16.0;
+}
+
+/// Standard container frame for cards in the modern UI layout.
+pub fn card_frame() -> egui::Frame {
+    egui::Frame::default()
+        .fill(COLOR_BG_CARD)
+        .corner_radius(corner_radius(6))
+        .stroke(Stroke::new(1.0, COLOR_BORDER_SUBTLE))
+        .inner_margin(Margin::same(12))
+}
+
+/// Render a pill status badge with a drawn circle dot indicator.
+pub fn render_status_badge(ui: &mut egui::Ui, state: ConnectionBadgeState) {
+    let text = state.label();
+    let dot_color = state.dot_color();
+    let bg_color = state.bg_color();
+
+    egui::Frame::default()
+        .fill(bg_color)
+        .corner_radius(corner_radius(4))
+        .stroke(Stroke::new(1.0, COLOR_BORDER_SUBTLE))
+        .inner_margin(Margin {
+            left: 8,
+            right: 8,
+            top: 4,
+            bottom: 4,
+        })
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(8.0, 8.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 3.5, dot_color);
+                ui.label(
+                    RichText::new(text)
+                        .size(12.0)
+                        .strong()
+                        .color(COLOR_TEXT_PRIMARY),
+                );
+            });
+        });
+}
 
 /// Available lighting effect names for the GUI effect selector.
 pub const AVAILABLE_EFFECTS: &[&str] = &[
@@ -1043,7 +1257,9 @@ impl Default for AulaF75App {
 
 impl AulaF75App {
     /// Create a new instance for eframe initialization and spawn worker in connect-only mode.
-    pub fn new(_cc: &eframe::CreationContext) -> Self {
+    pub fn new(cc: &eframe::CreationContext) -> Self {
+        cc.egui_ctx.set_visuals(app_visuals());
+        cc.egui_ctx.style_mut(configure_app_style);
         let mut app = Self::default();
         app.start_worker(None);
         app
@@ -1520,162 +1736,442 @@ impl Drop for AulaF75App {
 
 impl eframe::App for AulaF75App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.set_visuals(egui::Visuals::dark());
         self.poll_worker_status();
 
         // Left side panel: Hardware Status & Device Metadata
         egui::SidePanel::left("device_info")
             .resizable(false)
-            .default_width(210.0)
+            .default_width(230.0)
             .show(ctx, |ui| {
-                ui.heading("Hardware Status");
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Hardware Status")
+                        .strong()
+                        .size(15.0)
+                        .color(COLOR_TEXT_PRIMARY),
+                );
                 ui.add_space(8.0);
 
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        let (indicator_color, indicator_text) = if self.control_node_path.is_some() {
-                            if self.is_streaming() {
-                                (egui::Color32::from_rgb(46, 204, 113), "Streaming Active")
+                // Hardware Status Card
+                card_frame().show(ui, |ui| {
+                    let badge_state = ConnectionBadgeState::determine(
+                        self.control_node_path.is_some(),
+                        self.is_streaming(),
+                        &self.status_text,
+                        self.last_error.is_some(),
+                    );
+                    render_status_badge(ui, badge_state);
+
+                    ui.add_space(10.0);
+
+                    // Device Facts Grid
+                    egui::Grid::new("device_facts_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 5.0])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Device").size(11.0).color(COLOR_TEXT_MUTED));
+                            ui.label(
+                                RichText::new("AULA F75")
+                                    .size(11.0)
+                                    .strong()
+                                    .color(COLOR_TEXT_PRIMARY),
+                            );
+                            ui.end_row();
+
+                            ui.label(RichText::new("VID:PID").size(11.0).color(COLOR_TEXT_MUTED));
+                            ui.label(
+                                RichText::new("258a:010c")
+                                    .size(11.0)
+                                    .monospace()
+                                    .color(COLOR_TEXT_PRIMARY),
+                            );
+                            ui.end_row();
+
+                            ui.label(RichText::new("Interface").size(11.0).color(COLOR_TEXT_MUTED));
+                            ui.label(
+                                RichText::new("1 (Feature Report)")
+                                    .size(11.0)
+                                    .color(COLOR_TEXT_PRIMARY),
+                            );
+                            ui.end_row();
+
+                            ui.label(RichText::new("Node").size(11.0).color(COLOR_TEXT_MUTED));
+                            if let Some(ref path) = self.control_node_path {
+                                ui.label(
+                                    RichText::new(path.display().to_string())
+                                        .size(11.0)
+                                        .monospace()
+                                        .color(COLOR_ACCENT),
+                                );
+                            } else if self.status_text == "Connecting..." {
+                                ui.label(
+                                    RichText::new("Searching...")
+                                        .size(11.0)
+                                        .italics()
+                                        .color(COLOR_STATUS_CONNECTING),
+                                );
                             } else {
-                                (egui::Color32::from_rgb(46, 204, 113), "Connected (idle)")
+                                ui.label(
+                                    RichText::new("Not Found")
+                                        .size(11.0)
+                                        .color(COLOR_STATUS_ERROR),
+                                );
                             }
-                        } else if self.status_text == "Disconnected" {
-                            (egui::Color32::from_rgb(231, 76, 60), "Disconnected")
-                        } else {
-                            (egui::Color32::from_rgb(241, 196, 15), "Connecting...")
-                        };
+                            ui.end_row();
+                        });
 
-                        ui.colored_label(indicator_color, "●");
-                        ui.label(indicator_text);
-                    });
-
-                    ui.add_space(4.0);
-                    ui.label("Device: AULA F75");
-                    ui.label("VID:PID: 258a:010c");
-                    ui.label("Interface: 1 (HID Feature)");
-
-                    if let Some(ref path) = self.control_node_path {
-                        ui.label(format!("Node: {}", path.display()));
-                    } else if self.status_text == "Connecting..." {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(241, 196, 15),
-                            "Node: Searching...",
-                        );
-                    } else {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(231, 76, 60),
-                            "Node: Not Found",
-                        );
-                    }
-
+                    // Diagnostic microcopy for missing node or error
                     if let Some(ref err) = self.last_error {
-                        ui.add_space(4.0);
-                        ui.colored_label(
-                            egui::Color32::from_rgb(231, 76, 60),
-                            format!("Error: {}", err),
-                        );
+                        ui.add_space(8.0);
+                        egui::Frame::default()
+                            .fill(Color32::from_rgb(44, 18, 22))
+                            .corner_radius(corner_radius(4))
+                            .stroke(Stroke::new(1.0, COLOR_STATUS_ERROR))
+                            .inner_margin(Margin::same(6))
+                            .show(ui, |ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new("Error")
+                                            .size(11.0)
+                                            .strong()
+                                            .color(COLOR_STATUS_ERROR),
+                                    );
+                                    ui.label(
+                                        RichText::new(err)
+                                            .size(10.0)
+                                            .color(COLOR_TEXT_PRIMARY),
+                                    );
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        RichText::new("Action: Check USB connection or udev rules.")
+                                            .size(10.0)
+                                            .color(COLOR_TEXT_MUTED),
+                                    );
+                                });
+                            });
+                    } else if self.control_node_path.is_none() && self.status_text == "Disconnected" {
+                        ui.add_space(8.0);
+                        egui::Frame::default()
+                            .fill(COLOR_BG_INPUT)
+                            .corner_radius(corner_radius(4))
+                            .stroke(Stroke::new(1.0, COLOR_BORDER_SUBTLE))
+                            .inner_margin(Margin::same(6))
+                            .show(ui, |ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new("Cause: No hidraw node detected.")
+                                            .size(10.0)
+                                            .color(COLOR_TEXT_SECONDARY),
+                                    );
+                                    ui.label(
+                                        RichText::new("Action: Plug in USB cable and verify 99-aula-f75.rules.")
+                                            .size(10.0)
+                                            .color(COLOR_TEXT_MUTED),
+                                    );
+                                });
+                            });
                     }
                 });
 
-                ui.add_space(16.0);
-                ui.label("Requirements:");
-                ui.label("• Udev rule (99-aula-f75.rules)");
-                ui.label("• Keyboard in Custom/Static mode (Fn shortcuts)");
+                ui.add_space(14.0);
+
+                // Keyboard Reference Collapsible Section
+                egui::CollapsingHeader::new(
+                    RichText::new("Keyboard Reference")
+                        .strong()
+                        .size(13.0)
+                        .color(COLOR_TEXT_PRIMARY),
+                )
+                .default_open(true)
+                .show(ui, |ui| {
+                    card_frame().show(ui, |ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new("Onboard Shortcuts")
+                                    .strong()
+                                    .size(11.0)
+                                    .color(COLOR_ACCENT),
+                            );
+                            ui.add_space(4.0);
+
+                            ui.label(
+                                RichText::new("• Custom RGB Mode:")
+                                    .strong()
+                                    .size(10.0)
+                                    .color(COLOR_TEXT_PRIMARY),
+                            );
+                            ui.label(
+                                RichText::new("  Required for host software lighting.")
+                                    .size(10.0)
+                                    .color(COLOR_TEXT_MUTED),
+                            );
+
+                            ui.add_space(3.0);
+                            ui.label(
+                                RichText::new("• Fn + Backspace:")
+                                    .strong()
+                                    .size(10.0)
+                                    .color(COLOR_TEXT_PRIMARY),
+                            );
+                            ui.label(
+                                RichText::new("  Toggle backlight on / off.")
+                                    .size(10.0)
+                                    .color(COLOR_TEXT_MUTED),
+                            );
+
+                            ui.add_space(3.0);
+                            ui.label(
+                                RichText::new("• Knob Long-Press (~3-5s):")
+                                    .strong()
+                                    .size(10.0)
+                                    .color(COLOR_TEXT_PRIMARY),
+                            );
+                            ui.label(
+                                RichText::new("  Switch Multimedia (vol) / Lighting.")
+                                    .size(10.0)
+                                    .color(COLOR_TEXT_MUTED),
+                            );
+
+                            ui.add_space(3.0);
+                            ui.label(
+                                RichText::new("• Fn + B:")
+                                    .strong()
+                                    .size(10.0)
+                                    .color(COLOR_TEXT_PRIMARY),
+                            );
+                            ui.label(
+                                RichText::new("  Battery level check (1-0 row indicator).")
+                                    .size(10.0)
+                                    .color(COLOR_TEXT_MUTED),
+                            );
+                        });
+                    });
+                });
+
+                ui.add_space(14.0);
+
+                // System Requirements
+                egui::CollapsingHeader::new(
+                    RichText::new("System Requirements")
+                        .size(12.0)
+                        .color(COLOR_TEXT_SECONDARY),
+                )
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("• Udev rule: 99-aula-f75.rules in /etc/udev/rules.d/")
+                            .size(10.0)
+                            .color(COLOR_TEXT_MUTED),
+                    );
+                    ui.label(
+                        RichText::new("• Keyboard mode: Custom/Static onboard profile")
+                            .size(10.0)
+                            .color(COLOR_TEXT_MUTED),
+                    );
+                    ui.label(
+                        RichText::new("• Linux hidraw access without root")
+                            .size(10.0)
+                            .color(COLOR_TEXT_MUTED),
+                    );
+                });
             });
 
         // Central panel: Lighting Controls & Effect Engine
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("RGB Lighting Control");
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("RGB Lighting Control")
+                    .strong()
+                    .size(16.0)
+                    .color(COLOR_TEXT_PRIMARY),
+            );
             ui.add_space(8.0);
 
-            ui.group(|ui| {
-                // Effect selection
-                ui.horizontal(|ui| {
-                    ui.label("Lighting Effect:");
-                    egui::ComboBox::from_label("##effect_select")
-                        .selected_text(&self.selected_effect)
-                        .show_ui(ui, |ui| {
-                            for &eff in AVAILABLE_EFFECTS {
-                                if ui
-                                    .selectable_value(&mut self.selected_effect, eff.to_string(), eff)
-                                    .clicked()
-                                {
-                                    if self.is_streaming() {
-                                        self.dispatch_current_effect();
-                                    }
-                                }
+            card_frame().show(ui, |ui| {
+                // Effect selection as a segmented selectable row
+                ui.label(
+                    RichText::new("Lighting Effect")
+                        .size(12.0)
+                        .color(COLOR_TEXT_SECONDARY),
+                );
+                ui.add_space(4.0);
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                    for &eff in AVAILABLE_EFFECTS {
+                        let is_selected = self.selected_effect.eq_ignore_ascii_case(eff);
+                        let (bg, stroke, text_color) = if is_selected {
+                            (
+                                COLOR_ACCENT_BG,
+                                Stroke::new(1.5, COLOR_ACCENT),
+                                COLOR_TEXT_PRIMARY,
+                            )
+                        } else {
+                            (
+                                COLOR_BG_CARD,
+                                Stroke::new(1.0, COLOR_BORDER_SUBTLE),
+                                COLOR_TEXT_SECONDARY,
+                            )
+                        };
+
+                        let btn = egui::Button::new(
+                            RichText::new(eff).size(12.0).strong().color(text_color),
+                        )
+                        .fill(bg)
+                        .stroke(stroke)
+                        .min_size(Vec2::new(62.0, 28.0));
+
+                        if ui.add(btn).clicked() {
+                            self.selected_effect = eff.to_string();
+                            if self.is_streaming() {
+                                self.dispatch_current_effect();
                             }
-                        });
+                        }
+                    }
                 });
 
                 ui.add_space(8.0);
 
-                // Parameters: Color picker & Hex input (shown for Solid and Breathe)
-                let is_color_effect = self.selected_effect == "Solid" || self.selected_effect == "Breathe";
+                // Parameters: Color picker, Sliders, Hex input & Live Color Swatch
+                let is_color_effect =
+                    self.selected_effect == "Solid" || self.selected_effect == "Breathe";
                 if is_color_effect {
                     ui.horizontal(|ui| {
-                        ui.label("Color picker:");
-                        let mut srgb = self.color_rgb;
-                        if ui.color_edit_button_srgb(&mut srgb).changed() {
-                            self.set_color_from_picker(srgb);
-                        }
-                    });
-
-                    ui.add_space(4.0);
-
-                    // Manual RGB sliders
-                    ui.horizontal(|ui| {
-                        let mut r = self.color_rgb[0];
-                        let mut g = self.color_rgb[1];
-                        let mut b = self.color_rgb[2];
-                        let mut changed = false;
-
-                        if ui.add(egui::Slider::new(&mut r, 0..=255).text("R")).changed() {
-                            changed = true;
-                        }
-                        if ui.add(egui::Slider::new(&mut g, 0..=255).text("G")).changed() {
-                            changed = true;
-                        }
-                        if ui.add(egui::Slider::new(&mut b, 0..=255).text("B")).changed() {
-                            changed = true;
-                        }
-
-                        if changed {
-                            self.set_color_from_picker([r, g, b]);
-                        }
-                    });
-
-                    ui.add_space(4.0);
-
-                    // Hex text field
-                    ui.horizontal(|ui| {
-                        ui.label("Hex color:");
-                        let hex_resp = ui.text_edit_singleline(&mut self.hex_input);
-                        if hex_resp.lost_focus() || hex_resp.changed() {
-                            if let Ok(parsed) = parse_color_hex(&self.hex_input) {
-                                self.color_rgb = [parsed.0, parsed.1, parsed.2];
-                                self.hex_error = None;
-                                if self.is_streaming() {
-                                    self.dispatch_current_effect();
-                                }
-                            } else if !self.hex_input.is_empty() {
-                                self.hex_error = Some(
-                                    "Invalid hex format (expected 6 hex digits, e.g. FF0000 or #00FFFF)".to_string(),
+                        // Left column: Controls
+                        ui.vertical(|ui| {
+                            // Color picker
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("Color:")
+                                        .size(12.0)
+                                        .color(COLOR_TEXT_SECONDARY),
                                 );
-                            }
-                        }
-                    });
+                                let mut srgb = self.color_rgb;
+                                if ui.color_edit_button_srgb(&mut srgb).changed() {
+                                    self.set_color_from_picker(srgb);
+                                }
+                            });
 
-                    if let Some(ref err) = self.hex_error {
-                        ui.colored_label(egui::Color32::from_rgb(231, 76, 60), err);
-                    }
+                            ui.add_space(4.0);
+
+                            // Manual RGB sliders
+                            ui.horizontal(|ui| {
+                                let mut r = self.color_rgb[0];
+                                let mut g = self.color_rgb[1];
+                                let mut b = self.color_rgb[2];
+                                let mut changed = false;
+
+                                if ui.add(egui::Slider::new(&mut r, 0..=255).text("R")).changed() {
+                                    changed = true;
+                                }
+                                if ui.add(egui::Slider::new(&mut g, 0..=255).text("G")).changed() {
+                                    changed = true;
+                                }
+                                if ui.add(egui::Slider::new(&mut b, 0..=255).text("B")).changed() {
+                                    changed = true;
+                                }
+
+                                if changed {
+                                    self.set_color_from_picker([r, g, b]);
+                                }
+                            });
+
+                            ui.add_space(4.0);
+
+                            // Hex text field
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("Hex:")
+                                        .size(12.0)
+                                        .color(COLOR_TEXT_SECONDARY),
+                                );
+                                let hex_resp = ui.text_edit_singleline(&mut self.hex_input);
+                                if hex_resp.lost_focus() || hex_resp.changed() {
+                                    if let Ok(parsed) = parse_color_hex(&self.hex_input) {
+                                        self.color_rgb = [parsed.0, parsed.1, parsed.2];
+                                        self.hex_error = None;
+                                        if self.is_streaming() {
+                                            self.dispatch_current_effect();
+                                        }
+                                    } else if !self.hex_input.is_empty() {
+                                        self.hex_error = Some(
+                                            "Invalid hex format (expected 6 hex digits, e.g. FF0000 or #00FFFF)".to_string(),
+                                        );
+                                    }
+                                }
+                            });
+
+                            if let Some(ref err) = self.hex_error {
+                                ui.colored_label(COLOR_STATUS_ERROR, err);
+                            }
+                        });
+
+                        ui.add_space(16.0);
+
+                        // Right column: Live Color Preview Swatch
+                        let preview_rgb = compute_preview_rgb(self.color_rgb, self.brightness);
+                        let preview_color =
+                            Color32::from_rgb(preview_rgb.0, preview_rgb.1, preview_rgb.2);
+                        let base_hex = format!(
+                            "#{:02X}{:02X}{:02X}",
+                            self.color_rgb[0], self.color_rgb[1], self.color_rgb[2]
+                        );
+                        let output_hex = format!(
+                            "#{:02X}{:02X}{:02X}",
+                            preview_rgb.0, preview_rgb.1, preview_rgb.2
+                        );
+
+                        egui::Frame::default()
+                            .fill(COLOR_BG_INPUT)
+                            .corner_radius(corner_radius(6))
+                            .stroke(Stroke::new(1.0, COLOR_BORDER_SUBTLE))
+                            .inner_margin(Margin::same(8))
+                            .show(ui, |ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new("Output Swatch")
+                                            .size(11.0)
+                                            .color(COLOR_TEXT_MUTED),
+                                    );
+                                    ui.add_space(4.0);
+                                    egui::Frame::default()
+                                        .fill(preview_color)
+                                        .corner_radius(corner_radius(4))
+                                        .stroke(Stroke::new(1.0, COLOR_BORDER_SUBTLE))
+                                        .show(ui, |ui| {
+                                            ui.allocate_exact_size(
+                                                Vec2::new(72.0, 40.0),
+                                                egui::Sense::hover(),
+                                            );
+                                        });
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        RichText::new(output_hex)
+                                            .size(11.0)
+                                            .monospace()
+                                            .strong()
+                                            .color(COLOR_TEXT_PRIMARY),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!("Base: {}", base_hex))
+                                            .size(10.0)
+                                            .monospace()
+                                            .color(COLOR_TEXT_MUTED),
+                                    );
+                                });
+                            });
+                    });
 
                     ui.add_space(6.0);
                 }
 
                 // Brightness slider
                 ui.horizontal(|ui| {
-                    ui.label("Brightness:");
+                    ui.label(
+                        RichText::new("Brightness:")
+                            .size(12.0)
+                            .color(COLOR_TEXT_SECONDARY),
+                    );
                     let pct_label = format!("{:.0}%", self.brightness * 100.0);
                     if ui
                         .add(egui::Slider::new(&mut self.brightness, 0.0..=1.0).text(pct_label))
@@ -1689,27 +2185,55 @@ impl eframe::App for AulaF75App {
 
                 ui.add_space(10.0);
 
-                // Action buttons: Start Streaming, Stop / Off
+                // Action buttons: Start Streaming, Stop / Off (no emoji icons)
                 ui.horizontal(|ui| {
-                    if ui.button("▶ Start Streaming").clicked() {
+                    let start_btn = egui::Button::new(
+                        RichText::new("Start Streaming")
+                            .size(13.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    )
+                    .fill(Color32::from_rgb(0, 140, 175))
+                    .stroke(Stroke::new(1.0, COLOR_ACCENT))
+                    .min_size(Vec2::new(120.0, 32.0));
+
+                    if ui.add(start_btn).clicked() {
                         self.dispatch_current_effect();
                     }
 
-                    if ui.button("⏹ Stop / Off").clicked() {
+                    let stop_btn = egui::Button::new(
+                        RichText::new("Stop / Off")
+                            .size(13.0)
+                            .color(COLOR_TEXT_PRIMARY),
+                    )
+                    .fill(COLOR_BG_CARD)
+                    .stroke(Stroke::new(1.0, COLOR_BORDER_SUBTLE))
+                    .min_size(Vec2::new(100.0, 32.0));
+
+                    if ui.add(stop_btn).clicked() {
                         self.on_off_clicked();
                     }
                 });
             });
 
-            ui.add_space(12.0);
+            ui.add_space(14.0);
 
             // Lighting Profiles Panel
-            ui.heading("Lighting Profiles");
-            ui.add_space(8.0);
+            ui.label(
+                RichText::new("Lighting Profiles")
+                    .strong()
+                    .size(15.0)
+                    .color(COLOR_TEXT_PRIMARY),
+            );
+            ui.add_space(6.0);
 
-            ui.group(|ui| {
+            card_frame().show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("Saved profiles:");
+                    ui.label(
+                        RichText::new("Saved profiles:")
+                            .size(12.0)
+                            .color(COLOR_TEXT_SECONDARY),
+                    );
                     let current_selection = self
                         .selected_profile
                         .as_deref()
@@ -1727,11 +2251,14 @@ impl eframe::App for AulaF75App {
                             }
                         });
 
-                    if ui.button("Apply").clicked() {
+                    if ui.button(RichText::new("Apply").strong()).clicked() {
                         self.on_apply_profile_clicked();
                     }
 
-                    if ui.button("Delete").clicked() {
+                    if ui
+                        .button(RichText::new("Delete").color(COLOR_STATUS_ERROR))
+                        .clicked()
+                    {
                         self.on_delete_profile_clicked();
                     }
                 });
@@ -1739,7 +2266,11 @@ impl eframe::App for AulaF75App {
                 ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
-                    ui.label("Save current as:");
+                    ui.label(
+                        RichText::new("Save current as:")
+                            .size(12.0)
+                            .color(COLOR_TEXT_SECONDARY),
+                    );
                     ui.text_edit_singleline(&mut self.profile_name_input);
                     if ui.button("Save Profile").clicked() {
                         self.save_current_profile();
@@ -1749,23 +2280,32 @@ impl eframe::App for AulaF75App {
                 if let Some(ref status) = self.profile_status {
                     ui.add_space(4.0);
                     let color = if status.starts_with("Error") {
-                        egui::Color32::from_rgb(231, 76, 60)
+                        COLOR_STATUS_ERROR
                     } else {
-                        egui::Color32::from_rgb(46, 204, 113)
+                        COLOR_STATUS_STREAMING
                     };
                     ui.colored_label(color, status);
                 }
             });
 
-            ui.add_space(12.0);
+            ui.add_space(14.0);
 
             // Music Mode (Audio Reactive Lighting)
-            ui.heading("Audio Reactive Lighting (Music Mode)");
-            ui.add_space(8.0);
+            ui.label(
+                RichText::new("Audio Reactive Lighting (Music Mode)")
+                    .strong()
+                    .size(15.0)
+                    .color(COLOR_TEXT_PRIMARY),
+            );
+            ui.add_space(6.0);
 
-            ui.group(|ui| {
+            card_frame().show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("Reactive Mode:");
+                    ui.label(
+                        RichText::new("Reactive Mode:")
+                            .size(12.0)
+                            .color(COLOR_TEXT_SECONDARY),
+                    );
                     let current_mode_str = match self.music_mode {
                         MusicMode::Bars => "Bars (Spectrum across keys)",
                         MusicMode::Pulse => "Pulse (Whole-board beat)",
@@ -1802,7 +2342,11 @@ impl eframe::App for AulaF75App {
 
                 // Base Color Picker (reused)
                 ui.horizontal(|ui| {
-                    ui.label("Base Color:");
+                    ui.label(
+                        RichText::new("Base Color:")
+                            .size(12.0)
+                            .color(COLOR_TEXT_SECONDARY),
+                    );
                     let mut srgb = self.color_rgb;
                     if ui.color_edit_button_srgb(&mut srgb).changed() {
                         self.set_color_from_picker(srgb);
@@ -1813,7 +2357,11 @@ impl eframe::App for AulaF75App {
 
                 // Audio Gain Slider
                 ui.horizontal(|ui| {
-                    ui.label("Audio Gain:");
+                    ui.label(
+                        RichText::new("Audio Gain:")
+                            .size(12.0)
+                            .color(COLOR_TEXT_SECONDARY),
+                    );
                     let gain_label = format!("{:.1}x", self.music_gain);
                     if ui
                         .add(egui::Slider::new(&mut self.music_gain, 0.1..=5.0).text(gain_label))
@@ -1826,14 +2374,36 @@ impl eframe::App for AulaF75App {
 
                 ui.add_space(8.0);
 
-                // Start / Stop Music button
+                // Start / Stop Music button (plain text, no emoji icons)
                 ui.horizontal(|ui| {
                     if self.is_music_running() {
-                        if ui.button("⏹ Stop Music").clicked() {
+                        let stop_music_btn = egui::Button::new(
+                            RichText::new("Stop Music")
+                                .size(12.0)
+                                .strong()
+                                .color(COLOR_TEXT_PRIMARY),
+                        )
+                        .fill(COLOR_BG_CARD)
+                        .stroke(Stroke::new(1.0, COLOR_BORDER_SUBTLE))
+                        .min_size(Vec2::new(100.0, 28.0));
+
+                        if ui.add(stop_music_btn).clicked() {
                             self.on_off_clicked();
                         }
-                    } else if ui.button("▶ Start Music").clicked() {
-                        self.start_music();
+                    } else {
+                        let start_music_btn = egui::Button::new(
+                            RichText::new("Start Music")
+                                .size(12.0)
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(Color32::from_rgb(0, 140, 175))
+                        .stroke(Stroke::new(1.0, COLOR_ACCENT))
+                        .min_size(Vec2::new(100.0, 28.0));
+
+                        if ui.add(start_music_btn).clicked() {
+                            self.start_music();
+                        }
                     }
                 });
 
@@ -1848,7 +2418,11 @@ impl eframe::App for AulaF75App {
                 };
 
                 ui.horizontal(|ui| {
-                    ui.label("Audio Level:");
+                    ui.label(
+                        RichText::new("Audio Level:")
+                            .size(12.0)
+                            .color(COLOR_TEXT_SECONDARY),
+                    );
                     ui.add(
                         egui::ProgressBar::new(avg_level)
                             .text(format!("{:.0}%", avg_level * 100.0))
@@ -1857,39 +2431,68 @@ impl eframe::App for AulaF75App {
                 });
             });
 
-            ui.add_space(12.0);
+            ui.add_space(14.0);
 
             // Status footer
-            ui.group(|ui| {
-                let tick_rate_label = if self.is_streaming() {
-                    if self.is_music_running() {
-                        "~20 Hz (audio stream)"
-                    } else {
-                        match self.selected_effect.to_ascii_lowercase().as_str() {
-                            "solid" => "~1.5 Hz (keepalive)",
-                            "off" => "0 Hz (stopped)",
-                            _ => "~25 Hz (active stream)",
-                        }
-                    }
+            let tick_rate_label = if self.is_streaming() {
+                if self.is_music_running() {
+                    "~20 Hz"
                 } else {
-                    "0 Hz (idle)"
-                };
-
-                let active_name = if self.is_streaming() {
-                    if self.is_music_running() {
-                        format!("Music ({})", self.music_mode)
-                    } else {
-                        self.selected_effect.clone()
+                    match self.selected_effect.to_ascii_lowercase().as_str() {
+                        "solid" => "~1.5 Hz",
+                        "off" => "0 Hz",
+                        _ => "~25 Hz",
                     }
-                } else {
-                    "None".to_string()
-                };
+                }
+            } else {
+                "0 Hz"
+            };
 
-                ui.label(format!(
-                    "Active stream: {} | Tick rate: {} | {}",
-                    active_name, tick_rate_label, self.status_text
-                ));
-            });
+            let active_name = if self.is_streaming() {
+                if self.is_music_running() {
+                    format!("Music ({})", self.music_mode)
+                } else {
+                    self.selected_effect.clone()
+                }
+            } else {
+                "Idle".to_string()
+            };
+
+            egui::Frame::default()
+                .fill(COLOR_BG_INPUT)
+                .corner_radius(corner_radius(4))
+                .stroke(Stroke::new(1.0, COLOR_BORDER_SUBTLE))
+                .inner_margin(Margin {
+                    left: 10,
+                    right: 10,
+                    top: 6,
+                    bottom: 6,
+                })
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Stream:").size(11.0).color(COLOR_TEXT_MUTED));
+                        ui.label(
+                            RichText::new(&active_name)
+                                .size(11.0)
+                                .strong()
+                                .color(COLOR_TEXT_PRIMARY),
+                        );
+                        ui.separator();
+                        ui.label(RichText::new("Tick Rate:").size(11.0).color(COLOR_TEXT_MUTED));
+                        ui.label(
+                            RichText::new(tick_rate_label)
+                                .size(11.0)
+                                .monospace()
+                                .color(COLOR_TEXT_PRIMARY),
+                        );
+                        ui.separator();
+                        ui.label(
+                            RichText::new(&self.status_text)
+                                .size(11.0)
+                                .color(COLOR_TEXT_SECONDARY),
+                        );
+                    });
+                });
         });
 
         // Request repaint depending on streaming state
