@@ -162,10 +162,97 @@ fn test_aliases_resolve_correctly() {
 }
 
 #[test]
+fn test_iso_keys_aliases_resolve_correctly() {
+    // ISO '<>' key is slot 76
+    assert_eq!(slot_for_key("iso"), Some(76));
+    assert_eq!(slot_for_key("<"), slot_for_key("iso"));
+    assert_eq!(slot_for_key(">"), slot_for_key("iso"));
+    assert_eq!(slot_for_key("less"), slot_for_key("iso"));
+    assert_eq!(slot_for_key("greater"), slot_for_key("iso"));
+    assert_eq!(slot_for_key("less_than"), slot_for_key("iso"));
+    assert_eq!(slot_for_key("greater_than"), slot_for_key("iso"));
+    assert_eq!(slot_for_key("isobackslash"), slot_for_key("iso"));
+    assert_eq!(slot_for_key("nonusbackslash"), slot_for_key("iso"));
+
+    // Case-insensitivity for ISO '<>' key
+    assert_eq!(slot_for_key("ISO"), Some(76));
+    assert_eq!(slot_for_key("Less"), Some(76));
+    assert_eq!(slot_for_key("GREATER"), Some(76));
+
+    // ISO-ES 'ç' key is slot 75
+    assert_eq!(slot_for_key("cedilla"), Some(75));
+    assert_eq!(slot_for_key("ç"), slot_for_key("cedilla"));
+    assert_eq!(slot_for_key("Ç"), slot_for_key("cedilla"));
+    assert_eq!(slot_for_key("c_cedilla"), slot_for_key("cedilla"));
+    assert_eq!(slot_for_key("c-cedilla"), slot_for_key("cedilla"));
+
+    // Case-insensitivity for 'ç' / 'cedilla'
+    assert_eq!(slot_for_key("CEDILLA"), Some(75));
+    assert_eq!(slot_for_key("Cedilla"), Some(75));
+    assert_eq!(slot_for_key("C_Cedilla"), Some(75));
+}
+
+#[test]
+fn test_key_frame_exact_offsets_iso_keys() {
+    // Slot 75: bytes (8 + 75*3) .. (8 + 75*3 + 3) = 233..236
+    // Slot 76: bytes (8 + 76*3) .. (8 + 76*3 + 3) = 236..239
+    let offset_75 = 8 + 75 * 3;
+    let offset_76 = 8 + 76 * 3;
+    assert_eq!(offset_75, 233);
+    assert_eq!(offset_76, 236);
+
+    // Frame with 'ç' (slot 75)
+    let frame_cedilla = build_key_frame(&[("ç", (0x12, 0x34, 0x56))])
+        .expect("build_key_frame failed for 'ç'");
+    assert_eq!(&frame_cedilla[0..8], &HEADER);
+    // Neighbour slot 74 (offset 8 + 74*3 = 230) must be 0
+    assert_eq!(frame_cedilla[offset_75 - 3], 0x00);
+    assert_eq!(frame_cedilla[offset_75 - 2], 0x00);
+    assert_eq!(frame_cedilla[offset_75 - 1], 0x00);
+    // Slot 75 channels set
+    assert_eq!(frame_cedilla[offset_75], 0x12);
+    assert_eq!(frame_cedilla[offset_75 + 1], 0x34);
+    assert_eq!(frame_cedilla[offset_75 + 2], 0x56);
+    // Neighbour slot 76 must be 0
+    assert_eq!(frame_cedilla[offset_76], 0x00);
+    assert_eq!(frame_cedilla[offset_76 + 1], 0x00);
+    assert_eq!(frame_cedilla[offset_76 + 2], 0x00);
+
+    // Frame with '<' (slot 76)
+    let frame_less = build_key_frame(&[("<", (0xFE, 0xDC, 0xBA))])
+        .expect("build_key_frame failed for '<'");
+    assert_eq!(&frame_less[0..8], &HEADER);
+    // Neighbour slot 75 must be 0
+    assert_eq!(frame_less[offset_75], 0x00);
+    assert_eq!(frame_less[offset_75 + 1], 0x00);
+    assert_eq!(frame_less[offset_75 + 2], 0x00);
+    // Slot 76 channels set
+    assert_eq!(frame_less[offset_76], 0xFE);
+    assert_eq!(frame_less[offset_76 + 1], 0xDC);
+    assert_eq!(frame_less[offset_76 + 2], 0xBA);
+    // Neighbour slot 77 (offset 8 + 77*3 = 239) must be 0
+    assert_eq!(frame_less[offset_76 + 3], 0x00);
+    assert_eq!(frame_less[offset_76 + 4], 0x00);
+    assert_eq!(frame_less[offset_76 + 5], 0x00);
+
+    // Multi-key frame: '<' and 'ç' set simultaneously
+    let frame_multi = build_key_frame(&[("<", (0xAA, 0xBB, 0xCC)), ("ç", (0x11, 0x22, 0x33))])
+        .expect("build_key_frame failed for '<' and 'ç'");
+    assert_eq!(frame_multi[offset_75], 0x11);
+    assert_eq!(frame_multi[offset_75 + 1], 0x22);
+    assert_eq!(frame_multi[offset_75 + 2], 0x33);
+    assert_eq!(frame_multi[offset_76], 0xAA);
+    assert_eq!(frame_multi[offset_76 + 1], 0xBB);
+    assert_eq!(frame_multi[offset_76 + 2], 0xCC);
+    assert_eq!(frame_multi[offset_75 - 1], 0x00);
+    assert_eq!(frame_multi[offset_76 + 3], 0x00);
+}
+
+#[test]
 fn test_keys_list_count_at_least_80() {
     assert!(
-        KEY_SLOTS.len() >= 80,
-        "Expected at least 80 key entries in KEY_SLOTS, got {}",
+        KEY_SLOTS.len() >= 82,
+        "Expected at least 82 key entries in KEY_SLOTS, got {}",
         KEY_SLOTS.len()
     );
     assert_eq!(cmd_keys(), 0);
@@ -195,7 +282,7 @@ fn test_all_slot_values_under_170_and_unique() {
         KEY_SLOTS.len(),
         "All slots in KEY_SLOTS must be distinct"
     );
-    assert!(seen_slots.len() >= 80);
+    assert!(seen_slots.len() >= 82);
 }
 
 #[test]

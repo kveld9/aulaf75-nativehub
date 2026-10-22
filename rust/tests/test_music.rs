@@ -145,7 +145,7 @@ fn test_autogain_normalizes_and_decays() {
 #[test]
 fn test_bands_to_colors_lengths_and_bounds() {
     let nslots = proto::KEY_SLOTS.len();
-    assert_eq!(nslots, 80);
+    assert!(nslots >= 82, "KEY_SLOTS grew with ISO keys, got {}", nslots);
 
     // 1. Bars mode
     let band_levels = vec![0.0, 0.25, 0.5, 0.75, 1.0];

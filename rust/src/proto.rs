@@ -103,9 +103,11 @@ pub const KEY_SLOTS: &[(&str, u8)] = &[
     ("l", 57),
     ("semicolon", 63),
     ("quote", 69),
+    ("cedilla", 75),
     ("enter", 81),
     // Row 4
     ("lshift", 4),
+    ("iso", 76),
     ("z", 10),
     ("x", 16),
     ("c", 22),
@@ -180,6 +182,24 @@ const KEY_ALIASES: &[(&str, &str)] = &[
     ("leftwin", "lwin"),
     ("super", "lwin"),
     ("fn", "rfn"),
+    // ISO '<>' key variants
+    ("<", "iso"),
+    (">", "iso"),
+    ("less", "iso"),
+    ("greater", "iso"),
+    ("less_than", "iso"),
+    ("greater_than", "iso"),
+    ("isobackslash", "iso"),
+    ("iso_backslash", "iso"),
+    ("nubs", "iso"),
+    ("nonusbackslash", "iso"),
+    ("non_us_backslash", "iso"),
+    // ISO-ES 'ç' key variants
+    ("ç", "cedilla"),
+    ("Ç", "cedilla"),
+    ("c_cedilla", "cedilla"),
+    ("c-cedilla", "cedilla"),
+    ("ccedilla", "cedilla"),
 ];
 
 fn resolve_key_alias(alias: &str) -> &str {
@@ -193,12 +213,12 @@ fn resolve_key_alias(alias: &str) -> &str {
 
 /// Resolve the frame slot index for a given key name or alias (case-insensitive).
 pub fn slot_for_key(name: &str) -> Option<u8> {
-    let lower = name.trim().to_ascii_lowercase();
+    let lower = name.trim().to_lowercase();
     let canonical = resolve_key_alias(&lower);
 
     KEY_SLOTS
         .iter()
-        .find(|&&(k, _)| k.eq_ignore_ascii_case(canonical))
+        .find(|&&(k, _)| k.eq_ignore_ascii_case(canonical) || k == canonical)
         .map(|&(_, slot)| slot)
 }
 
@@ -685,6 +705,13 @@ mod tests {
         assert_eq!(slot_for_key("return"), slot_for_key("enter"));
         assert_eq!(slot_for_key("bksp"), slot_for_key("backspace"));
         assert_eq!(slot_for_key("caps"), slot_for_key("capslock"));
+        assert_eq!(slot_for_key("<"), slot_for_key("iso"));
+        assert_eq!(slot_for_key(">"), slot_for_key("iso"));
+        assert_eq!(slot_for_key("less"), slot_for_key("iso"));
+        assert_eq!(slot_for_key("greater"), slot_for_key("iso"));
+        assert_eq!(slot_for_key("ç"), slot_for_key("cedilla"));
+        assert_eq!(slot_for_key("Ç"), slot_for_key("cedilla"));
+        assert_eq!(slot_for_key("c_cedilla"), slot_for_key("cedilla"));
 
         // Unknown key returns None
         assert_eq!(slot_for_key("not_a_key"), None);
@@ -693,8 +720,8 @@ mod tests {
     #[test]
     fn test_key_slots_count_and_uniqueness() {
         assert!(
-            KEY_SLOTS.len() >= 80,
-            "KEY_SLOTS must contain at least 80 entries, got {}",
+            KEY_SLOTS.len() >= 82,
+            "KEY_SLOTS must contain at least 82 entries, got {}",
             KEY_SLOTS.len()
         );
 
